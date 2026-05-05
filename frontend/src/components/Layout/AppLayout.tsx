@@ -8,6 +8,11 @@ import {
   Alert,
   AlertTitle,
   Snackbar,
+  Menu,
+  MenuItem,
+  ListItemIcon,
+  ListItemText,
+  Divider,
   useMediaQuery,
   useTheme,
 } from '@mui/material';
@@ -16,6 +21,7 @@ import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
 import DragIndicatorIcon from '@mui/icons-material/DragIndicator';
 import DarkModeOutlinedIcon from '@mui/icons-material/DarkModeOutlined';
 import LightModeOutlinedIcon from '@mui/icons-material/LightModeOutlined';
+import LogoutIcon from '@mui/icons-material/Logout';
 
 import { useSessionStore } from '@/store/sessionStore';
 import { useAgentStore } from '@/store/agentStore';
@@ -47,6 +53,14 @@ export default function AppLayout() {
 
   const [showExpiredToast, setShowExpiredToast] = useState(false);
   const disconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [userMenuAnchor, setUserMenuAnchor] = useState<null | HTMLElement>(null);
+  const userMenuOpen = Boolean(userMenuAnchor);
+  const handleLogout = useCallback(() => {
+    // Databricks Apps proxy: hitting /logout clears the OAuth session and
+    // redirects back to the workspace login. Local dev (no proxy) just
+    // hard-reloads, which clears the in-memory user.
+    window.location.href = '/logout';
+  }, []);
 
   const isResizing = useRef(false);
 
@@ -263,26 +277,99 @@ export default function AppLayout() {
               {themeMode === 'dark' ? <LightModeOutlinedIcon fontSize="small" /> : <DarkModeOutlinedIcon fontSize="small" />}
             </IconButton>
 
-            {user?.picture ? (
-              <Avatar
-                src={user.picture}
-                alt={user.username || 'User'}
-                sx={{ width: 28, height: 28, ml: 0.5 }}
-              />
-            ) : user?.username ? (
-              <Avatar
-                sx={{
-                  width: 28,
-                  height: 28,
-                  ml: 0.5,
-                  bgcolor: 'primary.main',
-                  fontSize: '0.75rem',
-                  fontWeight: 700,
-                }}
-              >
-                {user.username[0].toUpperCase()}
-              </Avatar>
-            ) : null}
+            {user?.username && (
+              <>
+                <IconButton
+                  onClick={(e) => setUserMenuAnchor(e.currentTarget)}
+                  size="small"
+                  sx={{ ml: 0.5, p: 0.25 }}
+                  aria-label="Account menu"
+                >
+                  {user.picture ? (
+                    <Avatar
+                      src={user.picture}
+                      alt={user.username}
+                      sx={{ width: 28, height: 28 }}
+                    />
+                  ) : (
+                    <Avatar
+                      sx={{
+                        width: 28,
+                        height: 28,
+                        bgcolor: 'primary.main',
+                        fontSize: '0.75rem',
+                        fontWeight: 700,
+                      }}
+                    >
+                      {user.username[0].toUpperCase()}
+                    </Avatar>
+                  )}
+                </IconButton>
+                <Menu
+                  anchorEl={userMenuAnchor}
+                  open={userMenuOpen}
+                  onClose={() => setUserMenuAnchor(null)}
+                  anchorOrigin={{ vertical: 'bottom', horizontal: 'right' }}
+                  transformOrigin={{ vertical: 'top', horizontal: 'right' }}
+                  slotProps={{
+                    paper: {
+                      sx: {
+                        mt: 1,
+                        minWidth: 220,
+                        bgcolor: 'var(--panel)',
+                        border: '1px solid var(--border)',
+                        boxShadow: 'var(--shadow-1)',
+                        borderRadius: 'var(--radius-md)',
+                      },
+                    },
+                  }}
+                >
+                  <Box sx={{ px: 2, py: 1.25 }}>
+                    <Typography
+                      sx={{
+                        fontSize: '0.62rem',
+                        textTransform: 'uppercase',
+                        letterSpacing: '0.08em',
+                        color: 'var(--muted-text)',
+                        fontWeight: 700,
+                      }}
+                    >
+                      Signed in as
+                    </Typography>
+                    <Typography
+                      sx={{
+                        fontSize: '0.85rem',
+                        fontWeight: 600,
+                        color: 'var(--text)',
+                        wordBreak: 'break-all',
+                      }}
+                    >
+                      {user.username}
+                    </Typography>
+                  </Box>
+                  <Divider sx={{ borderColor: 'var(--border)' }} />
+                  <MenuItem
+                    onClick={() => {
+                      setUserMenuAnchor(null);
+                      handleLogout();
+                    }}
+                    sx={{
+                      py: 1,
+                      fontSize: '0.85rem',
+                      '&:hover': { bgcolor: 'var(--hover-bg)' },
+                    }}
+                  >
+                    <ListItemIcon sx={{ color: 'var(--accent)', minWidth: '32px !important' }}>
+                      <LogoutIcon fontSize="small" />
+                    </ListItemIcon>
+                    <ListItemText
+                      primary="Sign out"
+                      primaryTypographyProps={{ fontSize: '0.85rem', fontWeight: 600 }}
+                    />
+                  </MenuItem>
+                </Menu>
+              </>
+            )}
           </Box>
         </Box>
 
