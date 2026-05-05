@@ -26,34 +26,31 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    logger.info("Starting HF Agent backend...")
-    # Start in-process hourly KPI rollup. Replaces an external cron so the
-    # rollup lives next to the data and reuses the Space's HF token.
+    logger.info("Starting backend...")
+    # MLflow Tracing flushes traces server-side; KPIs come from Lakeview
+    # over system.mlflow.traces + system.serving.endpoint_usage.
     try:
-        import kpis_scheduler
-        kpis_scheduler.start()
+        import lakebase
+        from session_manager import session_manager
+        lakebase.init(session_manager.config)
     except Exception as e:
-        logger.warning("KPI scheduler failed to start: %s", e)
+        logger.warning("Lakebase init skipped: %s", e)
 
     yield
 
-    logger.info("Shutting down HF Agent backend...")
+    logger.info("Shutting down backend...")
     try:
-        import kpis_scheduler
-        await kpis_scheduler.shutdown()
+        import lakebase
+        lakebase.shutdown()
     except Exception as e:
-        logger.warning("KPI scheduler shutdown failed: %s", e)
-
-    # Final-flush: save every still-active session so we don't lose traces on
-    # server restart. Uploads are detached subprocesses — this is fast.
+        logger.debug("Lakebase shutdown suppressed: %s", e)
     try:
         from session_manager import session_manager
         for sid, agent_session in list(session_manager.sessions.items()):
             sess = agent_session.session
             if sess.config.save_sessions:
                 try:
-                    sess.save_and_upload_detached(sess.config.session_dataset_repo)
-                    logger.info("Flushed session %s on shutdown", sid)
+                    sess.save_trajectory_local()
                 except Exception as e:
                     logger.warning("Failed to flush session %s: %s", sid, e)
     except Exception as e:
