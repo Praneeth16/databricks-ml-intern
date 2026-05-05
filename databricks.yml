@@ -41,6 +41,13 @@ variables:
 include:
   - resources/*.yml
 
+# Force-include the built frontend bundle. ``static/`` is gitignored, but the
+# Apps runtime needs the compiled assets present in the source upload — the
+# backend mounts <repo>/static at /. Run ``npm run build`` before deploy.
+sync:
+  include:
+    - static/**
+
 resources:
   apps:
     ml_intern:

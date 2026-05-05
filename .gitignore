@@ -72,3 +72,4 @@ checkpoint-*/
 runs/
 wandb/
 frontend/tsconfig.tsbuildinfo
+static/
