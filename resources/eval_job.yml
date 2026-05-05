@@ -16,7 +16,7 @@ resources:
       tasks:
         - task_key: evaluate
           spark_python_task:
-            python_file: ./scripts/eval_model.py
+            python_file: ../scripts/eval_model.py
             parameters:
               - --model
               - "{{job.parameters.model}}"
@@ -31,8 +31,10 @@ resources:
             node_type_id: ${var.node_type_gpu}
             spark_conf:
               spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
             custom_tags:
               ml_intern_purpose: model-eval
+              ResourceClass: SingleNode
       parameters:
         - name: model
           default: ml_intern.agent.placeholder

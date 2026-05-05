@@ -16,7 +16,7 @@ resources:
       tasks:
         - task_key: register
           spark_python_task:
-            python_file: ./scripts/register_prompt.py
+            python_file: ../scripts/register_prompt.py
             parameters:
               - --commit-message
               - "bundle deploy"
