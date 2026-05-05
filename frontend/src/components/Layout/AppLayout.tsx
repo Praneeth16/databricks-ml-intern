@@ -234,9 +234,9 @@ export default function AppLayout() {
           <Box sx={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 0.75 }}>
             <Box
               component="img"
-              src="/smolagents.webp"
-              alt="smolagents"
-              sx={{ width: { xs: 20, md: 22 }, height: { xs: 20, md: 22 } }}
+              src="/logo.svg"
+              alt="ML Intern"
+              sx={{ width: { xs: 22, md: 24 }, height: { xs: 22, md: 24 } }}
             />
             <Typography
               variant="subtitle1"
