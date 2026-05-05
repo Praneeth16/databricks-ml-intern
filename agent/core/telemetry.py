@@ -16,7 +16,6 @@ and never raise — telemetry is best-effort and must not break the agent.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Any
@@ -240,50 +239,23 @@ async def record_feedback(
 
 
 # ── heartbeat ──────────────────────────────────────────────────────────────
-
-# Module-level reference set for fire-and-forget heartbeat tasks. asyncio only
-# keeps *weak* references to tasks, so the returned Task would otherwise be
-# eligible for GC before running — the task gets discarded and the upload
-# silently never happens. Hold strong refs until the task completes.
-_heartbeat_tasks: set[asyncio.Task] = set()
+#
+# Removed in P4: previously flushed trajectory state to a HF dataset every
+# heartbeat_interval_s. MLflow Tracing now persists spans server-side via its
+# own background thread, so no manual mid-turn flush is needed. Local
+# trajectory snapshots still happen on auto_save and shutdown
+# (Session.save_trajectory_local).
 
 
 class HeartbeatSaver:
-    """Time-gated mid-turn flush.
+    """No-op shim retained for callsite stability.
 
-    Called from ``Session.send_event`` after every event. Fires
-    ``save_and_upload_detached`` in a worker thread at most once per
-    ``heartbeat_interval_s`` (default 60s). Guards against losing trace data
-    on long-running turns that crash before ``turn_complete``.
+    Mid-turn telemetry is now provided by MLflow Tracing's automatic span
+    flush. This class survives only so existing imports (``Session.send_event``
+    calls ``HeartbeatSaver.maybe_fire``) keep compiling; it's removed entirely
+    in P8 once the backend Session refactor settles.
     """
 
     @staticmethod
-    def maybe_fire(session: Any) -> None:
-        if not getattr(session.config, "save_sessions", False):
-            return
-        interval = getattr(session.config, "heartbeat_interval_s", 0) or 0
-        if interval <= 0:
-            return
-        now = time.monotonic()
-        last = getattr(session, "_last_heartbeat_ts", None)
-        if last is None:
-            # Initialise on first event; no save yet.
-            session._last_heartbeat_ts = now
-            return
-        if now - last < interval:
-            return
-        session._last_heartbeat_ts = now
-        repo_id = session.config.session_dataset_repo
-        try:
-            task = asyncio.get_running_loop().create_task(
-                asyncio.to_thread(session.save_and_upload_detached, repo_id)
-            )
-            # Hold a strong reference until the task finishes so asyncio can't
-            # GC it. ``set.discard`` is a no-op on missing keys → safe callback.
-            _heartbeat_tasks.add(task)
-            task.add_done_callback(_heartbeat_tasks.discard)
-        except RuntimeError:
-            try:
-                session.save_and_upload_detached(repo_id)
-            except Exception as e:
-                logger.debug("Heartbeat save failed (non-fatal): %s", e)
+    def maybe_fire(session: Any) -> None:  # noqa: ARG004 - kept for ABI
+        return

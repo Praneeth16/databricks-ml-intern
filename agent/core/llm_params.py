@@ -65,15 +65,18 @@ _patch_litellm_effort_validation()
 
 
 # Effort levels accepted on the wire.
-#   Anthropic (4.6+):  low | medium | high | xhigh | max   (output_config.effort)
-#   OpenAI direct:     minimal | low | medium | high       (reasoning_effort top-level)
-#   HF router:         low | medium | high                 (extra_body.reasoning_effort)
+#   Anthropic (4.6+):    low | medium | high | xhigh | max   (output_config.effort)
+#   OpenAI direct:       minimal | low | medium | high       (reasoning_effort top-level)
+#   HF router:           low | medium | high                 (extra_body.reasoning_effort)
+#   Databricks FMAPI:    low | medium | high                 (extra_body.reasoning_effort
+#                                                              for Claude-on-Databricks)
 #
 # We validate *shape* here and let the probe cascade walk down on rejection;
 # we deliberately do NOT maintain a per-model capability table.
 _ANTHROPIC_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 _OPENAI_EFFORTS = {"minimal", "low", "medium", "high"}
 _HF_EFFORTS = {"low", "medium", "high"}
+_DATABRICKS_EFFORTS = {"low", "medium", "high"}
 
 
 class UnsupportedEffortError(ValueError):
@@ -152,6 +155,30 @@ def _resolve_llm_params(
                 # permitted".
                 params["thinking"] = {"type": "adaptive"}
                 params["output_config"] = {"effort": level}
+        return params
+
+    if model_name.startswith("databricks/"):
+        # Databricks Foundation Model API + AI Gateway. LiteLLM has native
+        # ``databricks/`` provider that auto-resolves api_base / api_key from
+        # the SDK auth chain (DATABRICKS_HOST + DATABRICKS_TOKEN, profile, or
+        # M2M). We don't pass them explicitly so users running ``databricks
+        # auth login`` work out of the box; if a session token is present
+        # (OBO from Apps), the caller plumbs it via DATABRICKS_TOKEN env in
+        # the request scope.
+        #
+        # Reasoning effort (Claude / GPT-class endpoints on Databricks) goes
+        # via ``extra_body.reasoning_effort`` — the FMAPI rejects it as a
+        # top-level kwarg.
+        params: dict = {"model": model_name}
+        if reasoning_effort:
+            level = "low" if reasoning_effort == "minimal" else reasoning_effort
+            if level not in _DATABRICKS_EFFORTS:
+                if strict:
+                    raise UnsupportedEffortError(
+                        f"Databricks FMAPI doesn't accept effort={level!r}"
+                    )
+            else:
+                params["extra_body"] = {"reasoning_effort": level}
         return params
 
     if model_name.startswith("bedrock/"):

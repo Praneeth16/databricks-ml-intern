@@ -15,9 +15,9 @@ from fastmcp.exceptions import ToolError
 from mcp.types import EmbeddedResource, ImageContent, TextContent
 
 from agent.config import MCPServerConfig
-from agent.tools.dataset_tools import (
-    HF_INSPECT_DATASET_TOOL_SPEC,
-    hf_inspect_dataset_handler,
+from agent.tools.databricks_jobs_tool import (
+    DATABRICKS_JOBS_TOOL_SPEC,
+    databricks_jobs_handler,
 )
 from agent.tools.docs_tools import (
     EXPLORE_HF_DOCS_TOOL_SPEC,
@@ -37,32 +37,28 @@ from agent.tools.github_read_file import (
     GITHUB_READ_FILE_TOOL_SPEC,
     github_read_file_handler,
 )
-from agent.tools.hf_repo_files_tool import (
-    HF_REPO_FILES_TOOL_SPEC,
-    hf_repo_files_handler,
-)
-from agent.tools.hf_repo_git_tool import (
-    HF_REPO_GIT_TOOL_SPEC,
-    hf_repo_git_handler,
-)
-from agent.tools.jobs_tool import HF_JOBS_TOOL_SPEC, hf_jobs_handler
+from agent.tools.hf_to_uc_tool import HF_TO_UC_TOOL_SPEC, hf_to_uc_handler
 from agent.tools.papers_tool import HF_PAPERS_TOOL_SPEC, hf_papers_handler
 from agent.tools.plan_tool import PLAN_TOOL_SPEC, plan_tool_handler
+from agent.tools.repos_tool import REPOS_TOOL_SPEC, repos_handler
 from agent.tools.research_tool import RESEARCH_TOOL_SPEC, research_handler
 from agent.tools.sandbox_tool import get_sandbox_tools
-
-# NOTE: Private HF repo tool disabled - replaced by hf_repo_files and hf_repo_git
-# from agent.tools.private_hf_repo_tools import (
-#     PRIVATE_HF_REPO_TOOL_SPEC,
-#     private_hf_repo_handler,
-# )
+from agent.tools.uc_dataset_tools import (
+    UC_DATASET_TOOL_SPEC,
+    uc_inspect_dataset_handler,
+)
+from agent.tools.uc_model_tools import UC_MODEL_TOOL_SPEC, uc_model_handler
+from agent.tools.uc_volume_tools import UC_VOLUME_TOOL_SPEC, uc_volume_handler
 
 # Suppress aiohttp deprecation warning
 warnings.filterwarnings(
     "ignore", category=DeprecationWarning, module="aiohttp.connector"
 )
 
-NOT_ALLOWED_TOOL_NAMES = ["hf_jobs", "hf_doc_search", "hf_doc_fetch", "hf_whoami"]
+# MCP tools we deliberately refuse to import even when surfaced. The HF
+# server's ``hf_doc_search`` / ``hf_doc_fetch`` / ``hf_whoami`` collide with
+# our own docs tools and the Databricks identity surface.
+NOT_ALLOWED_TOOL_NAMES = ["hf_doc_search", "hf_doc_fetch", "hf_whoami"]
 
 
 def convert_mcp_content_to_string(content: list) -> str:
@@ -310,13 +306,6 @@ def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
             parameters=HF_PAPERS_TOOL_SPEC["parameters"],
             handler=hf_papers_handler,
         ),
-        # Dataset inspection tool (unified)
-        ToolSpec(
-            name=HF_INSPECT_DATASET_TOOL_SPEC["name"],
-            description=HF_INSPECT_DATASET_TOOL_SPEC["description"],
-            parameters=HF_INSPECT_DATASET_TOOL_SPEC["parameters"],
-            handler=hf_inspect_dataset_handler,
-        ),
         # Planning and job management tools
         ToolSpec(
             name=PLAN_TOOL_SPEC["name"],
@@ -325,23 +314,40 @@ def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
             handler=plan_tool_handler,
         ),
         ToolSpec(
-            name=HF_JOBS_TOOL_SPEC["name"],
-            description=HF_JOBS_TOOL_SPEC["description"],
-            parameters=HF_JOBS_TOOL_SPEC["parameters"],
-            handler=hf_jobs_handler,
-        ),
-        # HF Repo management tools
-        ToolSpec(
-            name=HF_REPO_FILES_TOOL_SPEC["name"],
-            description=HF_REPO_FILES_TOOL_SPEC["description"],
-            parameters=HF_REPO_FILES_TOOL_SPEC["parameters"],
-            handler=hf_repo_files_handler,
+            name=DATABRICKS_JOBS_TOOL_SPEC["name"],
+            description=DATABRICKS_JOBS_TOOL_SPEC["description"],
+            parameters=DATABRICKS_JOBS_TOOL_SPEC["parameters"],
+            handler=databricks_jobs_handler,
         ),
         ToolSpec(
-            name=HF_REPO_GIT_TOOL_SPEC["name"],
-            description=HF_REPO_GIT_TOOL_SPEC["description"],
-            parameters=HF_REPO_GIT_TOOL_SPEC["parameters"],
-            handler=hf_repo_git_handler,
+            name=UC_VOLUME_TOOL_SPEC["name"],
+            description=UC_VOLUME_TOOL_SPEC["description"],
+            parameters=UC_VOLUME_TOOL_SPEC["parameters"],
+            handler=uc_volume_handler,
+        ),
+        ToolSpec(
+            name=UC_DATASET_TOOL_SPEC["name"],
+            description=UC_DATASET_TOOL_SPEC["description"],
+            parameters=UC_DATASET_TOOL_SPEC["parameters"],
+            handler=uc_inspect_dataset_handler,
+        ),
+        ToolSpec(
+            name=UC_MODEL_TOOL_SPEC["name"],
+            description=UC_MODEL_TOOL_SPEC["description"],
+            parameters=UC_MODEL_TOOL_SPEC["parameters"],
+            handler=uc_model_handler,
+        ),
+        ToolSpec(
+            name=HF_TO_UC_TOOL_SPEC["name"],
+            description=HF_TO_UC_TOOL_SPEC["description"],
+            parameters=HF_TO_UC_TOOL_SPEC["parameters"],
+            handler=hf_to_uc_handler,
+        ),
+        ToolSpec(
+            name=REPOS_TOOL_SPEC["name"],
+            description=REPOS_TOOL_SPEC["description"],
+            parameters=REPOS_TOOL_SPEC["parameters"],
+            handler=repos_handler,
         ),
         ToolSpec(
             name=GITHUB_FIND_EXAMPLES_TOOL_SPEC["name"],

@@ -1,8 +1,6 @@
 import asyncio
 import json
 import logging
-import subprocess
-import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -79,8 +77,15 @@ class Session:
         hf_token: str | None = None,
         local_mode: bool = False,
         stream: bool = True,
+        databricks_user_token: str | None = None,
+        user_email: str | None = None,
     ):
         self.hf_token: Optional[str] = hf_token
+        # OBO token from the Apps proxy (X-Forwarded-Access-Token). Tools that
+        # need to act as the end user (databricks_jobs, uc_volume, sandbox)
+        # pick this up via getattr(session, "databricks_user_token", None).
+        self.databricks_user_token: Optional[str] = databricks_user_token
+        self.user_email: Optional[str] = user_email
         self.tool_router = tool_router
         self.stream = stream
         tool_specs = tool_router.get_tool_specs_for_llm() if tool_router else []
@@ -187,8 +192,7 @@ class Session:
         turns_since_last_save = self.turn_count - self.last_auto_save_turn
         if turns_since_last_save >= interval:
             logger.info(f"Auto-saving session (turn {self.turn_count})...")
-            # Fire-and-forget save - returns immediately
-            self.save_and_upload_detached(self.config.session_dataset_repo)
+            self.save_trajectory_local()
             self.last_auto_save_turn = self.turn_count
 
     def get_trajectory(self) -> dict:
@@ -294,62 +298,3 @@ class Session:
             logger.error(f"Failed to update local save status: {e}")
             return False
 
-    def save_and_upload_detached(self, repo_id: str) -> Optional[str]:
-        """
-        Save session locally and spawn detached subprocess for upload (fire-and-forget)
-
-        Args:
-            repo_id: HuggingFace dataset repo ID
-
-        Returns:
-            Path to local save file
-        """
-        # Save locally first (fast, synchronous)
-        local_path = self.save_trajectory_local(upload_status="pending")
-        if not local_path:
-            return None
-
-        # Spawn detached subprocess for upload (fire-and-forget)
-        try:
-            uploader_script = Path(__file__).parent / "session_uploader.py"
-
-            # Use Popen with detached process
-            subprocess.Popen(
-                [sys.executable, str(uploader_script), "upload", local_path, repo_id],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,  # Detach from parent
-            )
-        except Exception as e:
-            logger.warning(f"Failed to spawn upload subprocess: {e}")
-
-        return local_path
-
-    @staticmethod
-    def retry_failed_uploads_detached(
-        directory: str = "session_logs", repo_id: Optional[str] = None
-    ) -> None:
-        """
-        Spawn detached subprocess to retry failed/pending uploads (fire-and-forget)
-
-        Args:
-            directory: Directory containing session logs
-            repo_id: Target dataset repo ID
-        """
-        if not repo_id:
-            return
-
-        try:
-            uploader_script = Path(__file__).parent / "session_uploader.py"
-
-            # Spawn detached subprocess for retry
-            subprocess.Popen(
-                [sys.executable, str(uploader_script), "retry", directory, repo_id],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,  # Detach from parent
-            )
-        except Exception as e:
-            logger.warning(f"Failed to spawn retry subprocess: {e}")

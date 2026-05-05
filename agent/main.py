@@ -25,7 +25,6 @@ from agent.core.agent_loop import submission_loop
 from agent.core import model_switcher
 from agent.core.session import OpType
 from agent.core.tools import ToolRouter
-from agent.utils.reliability_checks import check_training_script_save_pattern
 from agent.utils.terminal_display import (
     get_console,
     print_approval_header,
@@ -50,13 +49,6 @@ litellm.drop_params = True
 # on every error — users don't need it, and our friendly errors cover the case.
 litellm.suppress_debug_info = True
 
-def _safe_get_args(arguments: dict) -> dict:
-    """Safely extract args dict from arguments, handling cases where LLM passes string."""
-    args = arguments.get("args", {})
-    # Sometimes LLM passes args as string instead of dict
-    if isinstance(args, str):
-        return {}
-    return args if isinstance(args, dict) else {}
 
 
 def _get_hf_token() -> str | None:
@@ -415,195 +407,69 @@ async def event_listener(
                     print_approval_item(i, count, tool_name, operation)
 
                     # Handle different tool types
-                    if tool_name == "hf_jobs":
-                        # Check if this is Python mode (script) or Docker mode (command)
+                    if tool_name == "databricks_jobs":
+                        kind = arguments.get("kind", "script")
                         script = arguments.get("script")
-                        command = arguments.get("command")
-
-                        if script:
-                            # Python mode
-                            dependencies = arguments.get("dependencies", [])
-                            python_version = arguments.get("python")
-                            script_args = arguments.get("script_args", [])
-
-                            # Show full script
-                            print(f"Script:\n{script}")
-                            if dependencies:
-                                print(f"Dependencies: {', '.join(dependencies)}")
-                            if python_version:
-                                print(f"Python version: {python_version}")
-                            if script_args:
-                                print(f"Script args: {' '.join(script_args)}")
-
-                            # Run reliability checks on the full script (not truncated)
-                            check_message = check_training_script_save_pattern(script)
-                            if check_message:
-                                print(check_message)
-                        elif command:
-                            # Docker mode
-                            image = arguments.get("image", "python:3.12")
-                            command_str = (
-                                " ".join(command)
-                                if isinstance(command, list)
-                                else str(command)
-                            )
-                            print(f"Docker image: {image}")
-                            print(f"Command: {command_str}")
-
-                        # Common parameters for jobs
-                        hardware_flavor = arguments.get("hardware_flavor", "cpu-basic")
+                        workspace_path = arguments.get("workspace_path")
+                        hardware_flavor = arguments.get("hardware_flavor")
+                        node_type_id = arguments.get("node_type_id")
                         timeout = arguments.get("timeout", "30m")
                         env = arguments.get("env", {})
                         schedule = arguments.get("schedule")
 
-                        print(f"Hardware: {hardware_flavor}")
-                        print(f"Timeout: {timeout}")
-
-                        if env:
-                            env_keys = ", ".join(env.keys())
-                            print(f"Environment variables: {env_keys}")
-
-                        if schedule:
-                            print(f"Schedule: {schedule}")
-
-                    elif tool_name == "hf_private_repos":
-                        # Handle private repo operations
-                        args = _safe_get_args(arguments)
-
-                        if operation in ["create_repo", "upload_file"]:
-                            repo_id = args.get("repo_id", "")
-                            repo_type = args.get("repo_type", "dataset")
-
-                            # Build repo URL
-                            type_path = "" if repo_type == "model" else f"{repo_type}s"
-                            repo_url = (
-                                f"https://huggingface.co/{type_path}/{repo_id}".replace(
-                                    "//", "/"
-                                )
-                            )
-
-                            print(f"Repository: {repo_id}")
-                            print(f"Type: {repo_type}")
-                            print("Private: Yes")
-                            print(f"URL: {repo_url}")
-
-                            # Show file preview for upload_file operation
-                            if operation == "upload_file":
-                                path_in_repo = args.get("path_in_repo", "")
-                                file_content = args.get("file_content", "")
-                                print(f"File: {path_in_repo}")
-
-                                if isinstance(file_content, str):
-                                    # Calculate metrics
-                                    all_lines = file_content.split("\n")
-                                    line_count = len(all_lines)
-                                    size_bytes = len(file_content.encode("utf-8"))
-                                    size_kb = size_bytes / 1024
-                                    size_mb = size_kb / 1024
-
-                                    print(f"Line count: {line_count}")
-                                    if size_kb < 1024:
-                                        print(f"Size: {size_kb:.2f} KB")
-                                    else:
-                                        print(f"Size: {size_mb:.2f} MB")
-
-                                    # Show preview
-                                    preview_lines = all_lines[:5]
-                                    preview = "\n".join(preview_lines)
-                                    print(
-                                        f"Content preview (first 5 lines):\n{preview}"
-                                    )
-                                    if len(all_lines) > 5:
-                                        print("...")
-
-                    elif tool_name == "hf_repo_files":
-                        # Handle repo files operations (upload, delete)
-                        repo_id = arguments.get("repo_id", "")
-                        repo_type = arguments.get("repo_type", "model")
-                        revision = arguments.get("revision", "main")
-
-                        # Build repo URL
-                        if repo_type == "model":
-                            repo_url = f"https://huggingface.co/{repo_id}"
+                        print(f"Kind: {kind}")
+                        if kind == "finetune":
+                            print(f"Model: {arguments.get('model','?')}")
+                            print(f"Train data: {arguments.get('train_data_path','?')}")
+                            if arguments.get("register_to"):
+                                print(f"Register to: {arguments['register_to']}")
+                            if arguments.get("training_duration"):
+                                print(f"Duration: {arguments['training_duration']}")
                         else:
-                            repo_url = f"https://huggingface.co/{repo_type}s/{repo_id}"
+                            if script:
+                                print(f"Script:\n{script}")
+                            if workspace_path:
+                                print(f"Workspace path: {workspace_path}")
+                            if hardware_flavor:
+                                print(f"Hardware: {hardware_flavor}")
+                            if node_type_id:
+                                print(f"Node type: {node_type_id}")
+                            print(f"Timeout: {timeout}")
+                            if env:
+                                print(f"Env keys: {', '.join(env.keys())}")
+                            if schedule:
+                                print(f"Schedule: {schedule}")
 
-                        print(f"Repository: {repo_id}")
-                        print(f"Type: {repo_type}")
-                        print(f"Branch: {revision}")
-                        print(f"URL: {repo_url}")
-
-                        if operation == "upload":
-                            path = arguments.get("path", "")
+                    elif tool_name == "uc_volume":
+                        op = arguments.get("operation", "")
+                        path = arguments.get("path", "")
+                        print(f"Operation: {op}")
+                        print(f"Path: {path}")
+                        if op == "write":
                             content = arguments.get("content", "")
-                            create_pr = arguments.get("create_pr", False)
+                            print(f"Bytes: {len(content) if isinstance(content, str) else '?'}")
 
-                            print(f"File: {path}")
-                            if create_pr:
-                                print("Mode: Create PR")
-
-                            if isinstance(content, str):
-                                all_lines = content.split("\n")
-                                line_count = len(all_lines)
-                                size_bytes = len(content.encode("utf-8"))
-                                size_kb = size_bytes / 1024
-
-                                print(f"Lines: {line_count}")
-                                if size_kb < 1024:
-                                    print(f"Size: {size_kb:.2f} KB")
-                                else:
-                                    print(f"Size: {size_kb / 1024:.2f} MB")
-
-                                # Show full content
-                                print(f"Content:\n{content}")
-
-                        elif operation == "delete":
-                            patterns = arguments.get("patterns", [])
-                            if isinstance(patterns, str):
-                                patterns = [patterns]
-                            print(f"Patterns to delete: {', '.join(patterns)}")
-
-                    elif tool_name == "hf_repo_git":
-                        # Handle git operations (branches, tags, PRs, repo management)
-                        repo_id = arguments.get("repo_id", "")
-                        repo_type = arguments.get("repo_type", "model")
-
-                        # Build repo URL
-                        if repo_type == "model":
-                            repo_url = f"https://huggingface.co/{repo_id}"
+                    elif tool_name == "repos":
+                        op = arguments.get("operation", "")
+                        print(f"Operation: {op}")
+                        if op == "clone":
+                            print(f"URL: {arguments.get('url', '?')}")
                         else:
-                            repo_url = f"https://huggingface.co/{repo_type}s/{repo_id}"
+                            print(f"repo_id: {arguments.get('repo_id', '?')}")
 
-                        print(f"Repository: {repo_id}")
-                        print(f"Type: {repo_type}")
-                        print(f"URL: {repo_url}")
+                    elif tool_name == "uc_model":
+                        op = arguments.get("operation", "")
+                        print(f"Operation: {op}")
+                        print(f"Model: {arguments.get('full_name', '?')}")
+                        if "alias" in arguments:
+                            print(f"Alias: {arguments['alias']} → v{arguments.get('version', '?')}")
 
-                        if operation == "delete_branch":
-                            branch = arguments.get("branch", "")
-                            print(f"Branch to delete: {branch}")
-
-                        elif operation == "delete_tag":
-                            tag = arguments.get("tag", "")
-                            print(f"Tag to delete: {tag}")
-
-                        elif operation == "merge_pr":
-                            pr_num = arguments.get("pr_num", "")
-                            print(f"PR to merge: #{pr_num}")
-
-                        elif operation == "create_repo":
-                            private = arguments.get("private", False)
-                            space_sdk = arguments.get("space_sdk")
-                            print(f"Private: {private}")
-                            if space_sdk:
-                                print(f"Space SDK: {space_sdk}")
-
-                        elif operation == "update_repo":
-                            private = arguments.get("private")
-                            gated = arguments.get("gated")
-                            if private is not None:
-                                print(f"Private: {private}")
-                            if gated is not None:
-                                print(f"Gated: {gated}")
+                    elif tool_name == "hf_to_uc":
+                        op = arguments.get("operation", "")
+                        print(f"Operation: {op}")
+                        print(f"Repo: {arguments.get('repo_id', '?')}")
+                        if arguments.get("create_table"):
+                            print(f"Create table: {arguments.get('table_name', 'auto')}")
 
                     # Get user decision for this item. Ctrl+C / EOF here is
                     # treated as "reject remaining" (matches Codex's modal
@@ -832,8 +698,8 @@ async def main():
 
     # Pre-warm the HF router catalog in the background so /model switches
     # don't block on a network fetch.
-    from agent.core import hf_router_catalog
-    asyncio.create_task(asyncio.to_thread(hf_router_catalog.prewarm))
+    from agent.core import model_catalog
+    asyncio.create_task(asyncio.to_thread(model_catalog.prewarm))
 
     # Create queues for communication
     submission_queue = asyncio.Queue()
