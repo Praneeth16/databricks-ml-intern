@@ -1,0 +1,90 @@
+# Databricks Asset Bundle for databricks-ml-intern.
+#
+# One artifact, one deploy command:
+#
+#     databricks bundle deploy --target <env>
+#
+# Declares: the App itself, UC catalog/schema/volume, Lakebase instance,
+# secret scope, default instance pool (warm GPUs for sandbox), Lakeview KPI
+# dashboard, and bootstrap/eval jobs. Bundle deploy grants the App service
+# principal the exact UC privileges the resources need.
+
+bundle:
+  name: databricks-ml-intern
+
+variables:
+  uc_catalog:
+    description: Unity Catalog for agent artifacts + telemetry
+    default: ml_intern
+  uc_schema:
+    description: Schema under the catalog
+    default: agent
+  uc_volume:
+    description: Volume name for scratch + session artifacts
+    default: scratch
+  secret_scope:
+    description: Secret scope name
+    default: ml-intern
+  warehouse_id:
+    description: Existing serverless SQL warehouse ID
+  lakebase_instance:
+    description: Lakebase instance name for session state
+    default: ml-intern-state
+  instance_pool_id:
+    description: Warm instance pool ID for sandbox clusters (optional)
+    default: ""
+  node_type_gpu:
+    default: g5.xlarge
+  runtime_ml_gpu:
+    default: 15.4.x-gpu-ml-scala2.12
+
+include:
+  - resources/*.yml
+
+resources:
+  apps:
+    ml_intern:
+      name: databricks-ml-intern
+      description: Autonomous ML intern — fine-tunes models on Databricks
+      source_code_path: ./
+      # app.yaml is auto-picked up from source_code_path.
+
+  schemas:
+    ml_intern_agent:
+      catalog_name: ${var.uc_catalog}
+      name: ${var.uc_schema}
+      comment: Registered models, prompts, and session artifacts for ml-intern.
+      grants:
+        - principal: ${resources.apps.ml_intern.service_principal_name}
+          privileges:
+            - USE_SCHEMA
+            - CREATE_MODEL
+            - CREATE_VOLUME
+            - CREATE_TABLE
+            - CREATE_FUNCTION
+            - MODIFY
+            - SELECT
+
+  volumes:
+    ml_intern_scratch:
+      catalog_name: ${var.uc_catalog}
+      schema_name: ${var.uc_schema}
+      name: ${var.uc_volume}
+      volume_type: MANAGED
+      comment: Scratch + session artifacts for ml-intern.
+      grants:
+        - principal: ${resources.apps.ml_intern.service_principal_name}
+          privileges: [READ_VOLUME, WRITE_VOLUME]
+
+targets:
+  # Workspace host comes from the DATABRICKS_HOST env var (bundle does not
+  # support ${VAR} interpolation in workspace.host). Set it before running
+  # ``databricks bundle deploy --target <env>``.
+  dev:
+    mode: development
+    default: true
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/Shared/.bundle/ml-intern/prod

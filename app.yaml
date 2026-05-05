@@ -1,0 +1,85 @@
+# Databricks App manifest for databricks-ml-intern.
+#
+# Deployed via Databricks Asset Bundles (see databricks.yml). The Apps
+# runtime injects DATABRICKS_* env vars and forwards the end-user's OAuth
+# token via the X-Forwarded-Access-Token header — see backend/dependencies.py.
+#
+# Scoped access is declared via `resources` below. Grant the App's service
+# principal USE on each referenced resource during bundle deploy rather than
+# granting broad workspace permissions.
+
+command:
+  - bash
+  - backend/start.sh
+
+env:
+  - name: ML_INTERN_BACKEND
+    value: databricks
+  - name: MLFLOW_TRACKING_URI
+    value: databricks
+  - name: MLFLOW_REGISTRY_URI
+    value: databricks-uc
+  - name: PYTHONPATH
+    value: /app
+  - name: ML_INTERN_UC_CATALOG
+    valueFrom: uc_catalog
+  - name: ML_INTERN_UC_SCHEMA
+    valueFrom: uc_schema
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: sql_warehouse
+  - name: ML_INTERN_LAKEBASE_INSTANCE
+    valueFrom: lakebase
+
+# User OBO scopes — tool calls made on behalf of the end user carry these
+# scopes. Admin-only operations (bootstrap, schema creation) run as the App
+# service principal and are NOT gated by this list.
+user_authorization:
+  scopes:
+    - serving.serving-endpoints
+    - sql
+    - files.files
+    - iam.current-user:read
+    - catalog.connections
+    - workspace.workspace
+
+# Declared app resources. Bundle deploy binds each to the App and grants the
+# App service principal the listed permissions.
+resources:
+  - name: serving_endpoint
+    description: Default chat model (Foundation Model via AI Gateway)
+    serving_endpoint:
+      name: databricks-claude-opus-4
+      permission: CAN_QUERY
+
+  - name: sql_warehouse
+    description: Serverless SQL warehouse for UC reads
+    sql_warehouse:
+      id: ${var.warehouse_id}
+      permission: CAN_USE
+
+  - name: uc_catalog
+    description: Catalog for agent artifacts + telemetry
+    uc_securable:
+      securable_full_name: ${var.uc_catalog}
+      securable_type: CATALOG
+      permission: USE_CATALOG
+
+  - name: uc_schema
+    description: Schema for registered models, prompts, volumes
+    uc_securable:
+      securable_full_name: ${var.uc_catalog}.${var.uc_schema}
+      securable_type: SCHEMA
+      permission: ALL_PRIVILEGES
+
+  - name: secret_scope
+    description: Scope holding user GitHub tokens and optional external-model keys
+    secret:
+      scope: ${var.secret_scope}
+      key: placeholder
+      permission: READ
+
+  - name: lakebase
+    description: Session state + quotas
+    database:
+      instance_name: ${var.lakebase_instance}
+      permission: CAN_CONNECT_AND_CREATE
