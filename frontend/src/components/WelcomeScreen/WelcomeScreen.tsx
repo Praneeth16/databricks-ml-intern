@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
+import { useState, useCallback, type ReactNode } from 'react';
 import {
   Box,
   Typography,
@@ -7,19 +7,14 @@ import {
   Alert,
 } from '@mui/material';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
-import OpenInNewIcon from '@mui/icons-material/OpenInNew';
-import GroupAddIcon from '@mui/icons-material/GroupAdd';
 import LoginIcon from '@mui/icons-material/Login';
 import RocketLaunchIcon from '@mui/icons-material/RocketLaunch';
 import { useSessionStore } from '@/store/sessionStore';
 import { useAgentStore } from '@/store/agentStore';
 import { apiFetch } from '@/utils/api';
-import { isInIframe, triggerLogin } from '@/hooks/useAuth';
-import { useOrgMembership } from '@/hooks/useOrgMembership';
+import { triggerLogin } from '@/hooks/useAuth';
 
-const HF_ORANGE = '#FF9D00';
-const ORG_JOIN_URL =
-  'https://huggingface.co/organizations/ml-agent-explorers/share/GzPMJUivoFPlfkvFtIqEouZKSytatKQSZT';
+const DBX_ORANGE = '#FF3621';
 
 // ---------------------------------------------------------------------------
 // ChecklistStep sub-component
@@ -36,7 +31,6 @@ interface ChecklistStepProps {
   actionLabel?: string;
   onAction?: () => void;
   actionIcon?: ReactNode;
-  actionHref?: string;
   loading?: boolean;
   isLast?: boolean;
 }
@@ -57,7 +51,7 @@ function StepIndicator({ status, stepNumber }: { status: StepStatus; stepNumber:
         fontSize: '0.8rem',
         fontWeight: 700,
         ...(status === 'active'
-          ? { bgcolor: HF_ORANGE, color: '#000' }
+          ? { bgcolor: DBX_ORANGE, color: '#fff' }
           : { bgcolor: 'transparent', border: '2px solid var(--border)', color: 'var(--muted-text)' }),
       }}
     >
@@ -75,7 +69,6 @@ function ChecklistStep({
   actionLabel,
   onAction,
   actionIcon,
-  actionHref,
   loading = false,
   isLast = false,
 }: ChecklistStepProps) {
@@ -90,10 +83,10 @@ function ChecklistStep({
     textDecoration: 'none',
     ...(status === 'active'
       ? {
-          bgcolor: HF_ORANGE,
-          color: '#000',
-          boxShadow: '0 2px 12px rgba(255, 157, 0, 0.25)',
-          '&:hover': { bgcolor: '#FFB340', boxShadow: '0 4px 20px rgba(255, 157, 0, 0.4)' },
+          bgcolor: DBX_ORANGE,
+          color: '#fff',
+          boxShadow: '0 2px 12px rgba(255, 54, 33, 0.25)',
+          '&:hover': { bgcolor: '#FF5A47', boxShadow: '0 4px 20px rgba(255, 54, 33, 0.4)' },
         }
       : {
           bgcolor: 'rgba(255,255,255,0.04)',
@@ -115,7 +108,7 @@ function ChecklistStep({
           status === 'completed'
             ? 'var(--accent-green)'
             : status === 'active'
-              ? HF_ORANGE
+              ? DBX_ORANGE
               : 'transparent',
         ...(!isLast && { borderBottom: '1px solid var(--border)' }),
         opacity: status === 'locked' ? 0.55 : 1,
@@ -146,40 +139,26 @@ function ChecklistStep({
           Done
         </Typography>
       ) : actionLabel ? (
-        actionHref ? (
-          <Button
-            variant="contained"
-            size="small"
-            component="a"
-            href={actionHref}
-            target="_blank"
-            rel="noopener noreferrer"
-            disabled={status === 'locked'}
-            startIcon={actionIcon}
-            sx={btnSx}
-            onClick={onAction}
-          >
-            {actionLabel}
-          </Button>
-        ) : (
-          <Button
-            variant="contained"
-            size="small"
-            disabled={status === 'locked' || loading}
-            startIcon={loading ? <CircularProgress size={16} color="inherit" /> : actionIcon}
-            onClick={onAction}
-            sx={btnSx}
-          >
-            {loading ? 'Loading...' : actionLabel}
-          </Button>
-        )
+        <Button
+          variant="contained"
+          size="small"
+          disabled={status === 'locked' || loading}
+          startIcon={loading ? <CircularProgress size={16} color="inherit" /> : actionIcon}
+          onClick={onAction}
+          sx={btnSx}
+        >
+          {loading ? 'Loading...' : actionLabel}
+        </Button>
       ) : null}
     </Box>
   );
 }
 
 // ---------------------------------------------------------------------------
-// WelcomeScreen
+// WelcomeScreen — Databricks Apps deploy. The Apps proxy authenticates the
+// user at the edge and forwards X-Forwarded-Access-Token, so by the time the
+// FE renders, identity is already resolved. Local dev falls back to the SDK
+// auth chain via /auth/me.
 // ---------------------------------------------------------------------------
 
 export default function WelcomeScreen() {
@@ -188,51 +167,7 @@ export default function WelcomeScreen() {
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const inIframe = isInIframe();
   const isAuthenticated = !!user?.authenticated;
-  const isDevUser = user?.username === 'dev';
-
-  // Iframe: localStorage-based org tracking (no auth token available)
-  const [iframeOrgJoined, setIframeOrgJoined] = useState(() => {
-    try { return localStorage.getItem('hf-agent-org-joined') === '1'; } catch { return false; }
-  });
-  const joinLinkOpened = useRef(false);
-
-  // Auto-advance when user returns from org join link (iframe only)
-  useEffect(() => {
-    if (!inIframe) return;
-    const handleVisibility = () => {
-      if (document.visibilityState !== 'visible' || !joinLinkOpened.current) return;
-      joinLinkOpened.current = false;
-      try { localStorage.setItem('hf-agent-org-joined', '1'); } catch { /* ignore */ }
-      setIframeOrgJoined(true);
-    };
-    document.addEventListener('visibilitychange', handleVisibility);
-    return () => document.removeEventListener('visibilitychange', handleVisibility);
-  }, [inIframe]);
-
-  const isOrgMember = inIframe ? iframeOrgJoined : !!user?.orgMember;
-
-  // Poll for org membership once authenticated (skipped in dev mode and iframe)
-  const popupRef = useOrgMembership(isAuthenticated && !isDevUser && !inIframe && !isOrgMember);
-
-  // ---- Actions ----
-
-  const handleJoinOrg = useCallback(() => {
-    if (inIframe) {
-      // Iframe: open link, track via visibilitychange + localStorage
-      joinLinkOpened.current = true;
-      window.open(ORG_JOIN_URL, '_blank', 'noopener,noreferrer');
-      return;
-    }
-    // Direct: open as popup, auto-close via polling
-    const popup = window.open(ORG_JOIN_URL, 'hf-org-join', 'noopener');
-    if (popup) {
-      popupRef.current = popup;
-    } else {
-      window.open(ORG_JOIN_URL, '_blank', 'noopener,noreferrer');
-    }
-  }, [popupRef, inIframe]);
 
   const handleStartSession = useCallback(async () => {
     if (isCreating) return;
@@ -265,19 +200,8 @@ export default function WelcomeScreen() {
     }
   }, [isCreating, createSession, setPlan, clearPanel]);
 
-  // ---- Step status helpers ----
-
   const signInStatus: StepStatus = isAuthenticated ? 'completed' : 'active';
-  const joinOrgStatus: StepStatus = isOrgMember ? 'completed' : isAuthenticated ? 'active' : 'locked';
-  const startStatus: StepStatus = isAuthenticated && isOrgMember ? 'active' : 'locked';
-
-  // Space URL for iframe "Open ML Intern" step
-  const spaceHost =
-    typeof window !== 'undefined'
-      ? window.location.hostname.includes('.hf.space')
-        ? window.location.origin
-        : 'https://smolagents-ml-intern.hf.space'
-      : '';
+  const startStatus: StepStatus = isAuthenticated ? 'active' : 'locked';
 
   return (
     <Box
@@ -292,15 +216,13 @@ export default function WelcomeScreen() {
         py: 8,
       }}
     >
-      {/* Logo */}
       <Box
         component="img"
         src="/smolagents.webp"
-        alt="smolagents"
+        alt="ml-intern"
         sx={{ width: 80, height: 80, mb: 2.5, display: 'block' }}
       />
 
-      {/* Title */}
       <Typography
         variant="h2"
         sx={{
@@ -314,7 +236,6 @@ export default function WelcomeScreen() {
         ML Intern
       </Typography>
 
-      {/* Description */}
       <Typography
         variant="body1"
         sx={{
@@ -328,10 +249,11 @@ export default function WelcomeScreen() {
           '& strong': { color: 'var(--text)', fontWeight: 600 },
         }}
       >
-        Your personal <strong>ML agent</strong>. It reads <strong>papers</strong>, finds <strong>datasets</strong>, trains <strong>models</strong>, and iterates until the numbers go up. Instructions in. Trained model out.
+        Your personal <strong>ML agent</strong> on Databricks. Reads <strong>papers</strong>,
+        ingests <strong>UC datasets</strong>, runs <strong>jobs</strong>, registers <strong>UC models</strong>,
+        and iterates until the numbers go up.
       </Typography>
 
-      {/* ── Checklist ──────────────────────────────────────────── */}
       <Box
         sx={{
           width: '100%',
@@ -343,12 +265,11 @@ export default function WelcomeScreen() {
           mx: 2,
         }}
       >
-        {isDevUser ? (
-          /* Dev mode: single step */
+        {isAuthenticated ? (
           <ChecklistStep
             stepNumber={1}
             title="Start Session"
-            description="Launch an AI agent session for ML engineering."
+            description="Launch an agent session connected to your Databricks workspace."
             status="active"
             actionLabel="Start Session"
             actionIcon={<RocketLaunchIcon sx={{ fontSize: 16 }} />}
@@ -356,37 +277,12 @@ export default function WelcomeScreen() {
             loading={isCreating}
             isLast
           />
-        ) : inIframe ? (
-          /* Iframe: 2 steps */
-          <>
-            <ChecklistStep
-              stepNumber={1}
-              title="Join ML Agent Explorers"
-              description="Get free access to GPUs, inference APIs, and Hub resources."
-              status={isOrgMember ? 'completed' : 'active'}
-              actionLabel="Join Organization"
-              actionIcon={<GroupAddIcon sx={{ fontSize: 16 }} />}
-              onAction={handleJoinOrg}
-            />
-            <ChecklistStep
-              stepNumber={2}
-              title="Open ML Intern"
-              description="Open the agent in a full browser tab to get started."
-              status={isOrgMember ? 'active' : 'locked'}
-              lockedReason="Join the organization first."
-              actionLabel="Open ML Intern"
-              actionIcon={<OpenInNewIcon sx={{ fontSize: 16 }} />}
-              actionHref={spaceHost}
-              isLast
-            />
-          </>
         ) : (
-          /* Direct access: 3 steps */
           <>
             <ChecklistStep
               stepNumber={1}
-              title="Sign in with Hugging Face"
-              description="Authenticate to access GPU resources and model APIs."
+              title="Sign in"
+              description="Authenticate to your Databricks workspace."
               status={signInStatus}
               actionLabel="Sign in"
               actionIcon={<LoginIcon sx={{ fontSize: 16 }} />}
@@ -394,20 +290,10 @@ export default function WelcomeScreen() {
             />
             <ChecklistStep
               stepNumber={2}
-              title="Join ML Agent Explorers"
-              description="Get free access to GPUs, inference APIs, and Hub resources."
-              status={joinOrgStatus}
-              lockedReason="Sign in first to continue."
-              actionLabel="Join Organization"
-              actionIcon={<GroupAddIcon sx={{ fontSize: 16 }} />}
-              onAction={handleJoinOrg}
-            />
-            <ChecklistStep
-              stepNumber={3}
               title="Start Session"
-              description="Launch an AI agent session for ML engineering."
+              description="Launch an agent session connected to your Databricks workspace."
               status={startStatus}
-              lockedReason="Complete the steps above to continue."
+              lockedReason="Sign in first to continue."
               actionLabel="Start Session"
               actionIcon={<RocketLaunchIcon sx={{ fontSize: 16 }} />}
               onAction={handleStartSession}
@@ -418,17 +304,6 @@ export default function WelcomeScreen() {
         )}
       </Box>
 
-      {/* Polling hint when waiting for org join */}
-      {isAuthenticated && !isOrgMember && !isDevUser && !inIframe && (
-        <Typography
-          variant="caption"
-          sx={{ mt: 2, color: 'var(--muted-text)', fontSize: '0.75rem', textAlign: 'center' }}
-        >
-          This page updates automatically when you join the organization.
-        </Typography>
-      )}
-
-      {/* Error */}
       {error && (
         <Alert
           severity="warning"
@@ -438,7 +313,7 @@ export default function WelcomeScreen() {
             mt: 3,
             maxWidth: 400,
             fontSize: '0.8rem',
-            borderColor: HF_ORANGE,
+            borderColor: DBX_ORANGE,
             color: 'var(--text)',
           }}
         >
@@ -446,12 +321,11 @@ export default function WelcomeScreen() {
         </Alert>
       )}
 
-      {/* Footnote */}
       <Typography
         variant="caption"
         sx={{ mt: 4, color: 'var(--muted-text)', opacity: 0.5, fontSize: '0.7rem' }}
       >
-        Conversations are stored locally in your browser.
+        Sessions persist in Lakebase. Telemetry via MLflow Tracing.
       </Typography>
     </Box>
   );

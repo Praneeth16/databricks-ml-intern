@@ -19,41 +19,42 @@ interface ModelOption {
   recommended?: boolean;
 }
 
-const getHfAvatarUrl = (modelId: string) => {
-  const org = modelId.split('/')[0];
-  return `https://huggingface.co/api/avatars/${org}`;
-};
+// Models served by Databricks Foundation Model API. Avatar is a generated
+// data URL (model initial on a coloured square) — no remote fetch.
+const initialAvatar = (label: string, color: string) =>
+  `data:image/svg+xml;utf8,${encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" rx="6" fill="${color}"/><text x="16" y="21" font-family="system-ui,sans-serif" font-size="16" font-weight="700" fill="#fff" text-anchor="middle">${label}</text></svg>`
+  )}`;
 
 const MODEL_OPTIONS: ModelOption[] = [
   {
-    id: 'kimi-k2.6',
-    name: 'Kimi K2.6',
-    description: 'Novita',
-    modelPath: 'moonshotai/Kimi-K2.6',
-    avatarUrl: getHfAvatarUrl('moonshotai/Kimi-K2.6'),
+    id: 'claude-opus-4',
+    name: 'Claude Opus 4',
+    description: 'Databricks FMAPI',
+    modelPath: 'databricks/databricks-claude-opus-4',
+    avatarUrl: initialAvatar('C', '#D97706'),
     recommended: true,
   },
   {
-    id: 'claude-opus',
-    name: 'Claude Opus 4.6',
-    description: 'Anthropic',
-    modelPath: 'anthropic/claude-opus-4-6',
-    avatarUrl: 'https://huggingface.co/api/avatars/Anthropic',
-    recommended: true,
+    id: 'claude-sonnet-4',
+    name: 'Claude Sonnet 4',
+    description: 'Databricks FMAPI',
+    modelPath: 'databricks/databricks-claude-sonnet-4',
+    avatarUrl: initialAvatar('C', '#D97706'),
   },
   {
-    id: 'minimax-m2.7',
-    name: 'MiniMax M2.7',
-    description: 'Novita',
-    modelPath: 'MiniMaxAI/MiniMax-M2.7',
-    avatarUrl: getHfAvatarUrl('MiniMaxAI/MiniMax-M2.7'),
+    id: 'llama-3-3-70b',
+    name: 'Llama 3.3 70B',
+    description: 'Databricks FMAPI',
+    modelPath: 'databricks/databricks-meta-llama-3-3-70b-instruct',
+    avatarUrl: initialAvatar('L', '#3B82F6'),
   },
   {
-    id: 'glm-5.1',
-    name: 'GLM 5.1',
-    description: 'Together',
-    modelPath: 'zai-org/GLM-5.1',
-    avatarUrl: getHfAvatarUrl('zai-org/GLM-5.1'),
+    id: 'gpt-oss-120b',
+    name: 'GPT-OSS 120B',
+    description: 'Databricks FMAPI',
+    modelPath: 'databricks/databricks-gpt-oss-120b',
+    avatarUrl: initialAvatar('G', '#10B981'),
   },
 ];
 
@@ -70,7 +71,7 @@ interface ChatInputProps {
   placeholder?: string;
 }
 
-const isClaudeModel = (m: ModelOption) => m.modelPath.startsWith('anthropic/');
+const isClaudeModel = (m: ModelOption) => m.modelPath.includes('claude');
 const firstFreeModel = () => MODEL_OPTIONS.find(m => !isClaudeModel(m)) ?? MODEL_OPTIONS[0];
 
 export default function ChatInput({ sessionId, onSend, onStop, isProcessing = false, disabled = false, placeholder = 'Ask anything...' }: ChatInputProps) {

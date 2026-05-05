@@ -122,10 +122,10 @@ interface AgentStore {
   // Edited scripts (tool_call_id -> edited content)
   editedScripts: Record<string, string>;
 
-  // Job URLs (tool_call_id -> job URL) for HF jobs
+  // Job URLs (tool_call_id -> job URL) for Databricks jobs
   jobUrls: Record<string, string>;
 
-  // Job statuses (tool_call_id -> job status) for HF jobs
+  // Job statuses (tool_call_id -> job status) for Databricks jobs
   jobStatuses: Record<string, string>;
 
   // Tool error states (tool_call_id -> true if errored) - persisted across renders
