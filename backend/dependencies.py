@@ -67,6 +67,7 @@ async def get_current_user(request: Request) -> dict[str, Any]:
         request.state.user_token = token
         settings = _settings()
         return {
+            "user_id": user_name,
             "user_name": user_name,
             "display_name": user_name,
             "email": email or user_name,
@@ -80,6 +81,7 @@ async def get_current_user(request: Request) -> dict[str, Any]:
         wc = db_client.get_workspace_client(settings)
         me = wc.current_user.me()
         return {
+            "user_id": me.user_name,
             "user_name": me.user_name,
             "display_name": me.display_name or me.user_name,
             "email": me.emails[0].value if me.emails else me.user_name,

@@ -166,20 +166,11 @@ def _resolve_llm_params(
         # (OBO from Apps), the caller plumbs it via DATABRICKS_TOKEN env in
         # the request scope.
         #
-        # Reasoning effort (Claude / GPT-class endpoints on Databricks) goes
-        # via ``extra_body.reasoning_effort`` — the FMAPI rejects it as a
-        # top-level kwarg.
-        params: dict = {"model": model_name}
-        if reasoning_effort:
-            level = "low" if reasoning_effort == "minimal" else reasoning_effort
-            if level not in _DATABRICKS_EFFORTS:
-                if strict:
-                    raise UnsupportedEffortError(
-                        f"Databricks FMAPI doesn't accept effort={level!r}"
-                    )
-            else:
-                params["extra_body"] = {"reasoning_effort": level}
-        return params
+        # FMAPI endpoints reject reasoning_effort outright (both top-level and
+        # via extra_body) — the rejection comes from the served-model schema,
+        # not the gateway. Drop it on this branch; agent default behaviour
+        # remains correct because the parameter is advisory.
+        return {"model": model_name}
 
     if model_name.startswith("bedrock/"):
         # LiteLLM routes ``bedrock/...`` through the Converse adapter, which
