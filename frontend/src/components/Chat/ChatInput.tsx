@@ -32,7 +32,7 @@ const MODEL_OPTIONS: ModelOption[] = [
     name: 'Claude Opus 4',
     description: 'Databricks FMAPI',
     modelPath: 'databricks/databricks-claude-opus-4',
-    avatarUrl: initialAvatar('C', '#D97706'),
+    avatarUrl: initialAvatar('C', '#FF3621'),
     recommended: true,
   },
   {
@@ -40,21 +40,21 @@ const MODEL_OPTIONS: ModelOption[] = [
     name: 'Claude Sonnet 4',
     description: 'Databricks FMAPI',
     modelPath: 'databricks/databricks-claude-sonnet-4',
-    avatarUrl: initialAvatar('C', '#D97706'),
+    avatarUrl: initialAvatar('C', '#FF6B47'),
   },
   {
     id: 'llama-3-3-70b',
     name: 'Llama 3.3 70B',
     description: 'Databricks FMAPI',
     modelPath: 'databricks/databricks-meta-llama-3-3-70b-instruct',
-    avatarUrl: initialAvatar('L', '#3B82F6'),
+    avatarUrl: initialAvatar('L', '#3FA9F5'),
   },
   {
     id: 'gpt-oss-120b',
     name: 'GPT-OSS 120B',
     description: 'Databricks FMAPI',
     modelPath: 'databricks/databricks-gpt-oss-120b',
-    avatarUrl: initialAvatar('G', '#10B981'),
+    avatarUrl: initialAvatar('G', '#00A972'),
   },
 ];
 
