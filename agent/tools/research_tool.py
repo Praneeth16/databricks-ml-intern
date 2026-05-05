@@ -37,8 +37,8 @@ RESEARCH_TOOL_NAMES = {
     "github_find_examples",
     "github_list_repos",
     "github_read_file",
-    "hf_inspect_dataset",
-    "hf_repo_files",
+    # UC equivalents — research the data already living in this workspace.
+    "uc_inspect_dataset",
 }
 
 RESEARCH_SYSTEM_PROMPT = """\
@@ -62,7 +62,7 @@ tell you what actually works.
    - The training method and configuration (optimizer, lr, schedule, epochs, batch size)
    - The results those choices produced (benchmark scores, metrics, comparisons)
 4. **Attribute results to recipes**: This is the critical step. Every finding must link a RESULT to the RECIPE that produced it. "Dataset X + method Y + lr Z → score W on benchmark V" is useful. "They used SFT" is not.
-5. **Validate datasets**: For the most promising datasets, check if they exist on HF Hub with `hf_inspect_dataset`. Verify format matches the training method. Report if doesnt.
+5. **Validate datasets**: For datasets already in Unity Catalog, run `uc_inspect_dataset` to check schema and sample rows. For HF-only datasets, note them so the main agent can run `hf_to_uc` to ingest before training. Verify format matches the training method.
 6. **Find code**: Now find working implementation code via `github_find_examples` and `github_read_file`. Use docs (`explore_hf_docs`, `fetch_hf_docs`) to fill in API details.
 
 ## When to go deeper
@@ -88,7 +88,7 @@ tell you what actually works.
 - `hf_papers(operation="find_all_resources", arxiv_id=...)`: Datasets + models + collections for a paper
 
 ## Dataset inspection
-- `hf_inspect_dataset`: Check dataset schema, splits, sample rows
+- `uc_inspect_dataset`: Check schema / sample rows for UC tables (the durable training source).
   CRITICAL for training: verify column format matches training method:
   - SFT: needs "messages", "text", or "prompt"/"completion"
   - DPO: needs "prompt", "chosen", "rejected"
@@ -103,8 +103,8 @@ tell you what actually works.
 - `fetch_hf_docs(url)`: Fetch full page content from explore results
 - `find_hf_api(query=..., tag=...)`: Find REST API endpoints
 
-## Hub repo inspection
-- `hf_repo_files`: List/read files in any HF repo (model, dataset, space)
+## Hub repo inspection (HF, read-only)
+- The HF Hub research stays via `hf_papers` + GitHub tools. Repo file listing was dropped — use github_read_file or hf_papers find_all_resources for paper-linked datasets / models.
 
 # Correct research pattern
 
@@ -124,8 +124,8 @@ hf_papers({"operation": "read_paper", "arxiv_id": "2604.01348", "section": "4"})
 hf_papers({"operation": "find_datasets", "arxiv_id": "2604.01348"})
 hf_papers({"operation": "find_all_resources", "arxiv_id": "2604.01348"})
 
-# 5. Validate datasets exist and have correct format
-hf_inspect_dataset({"dataset": "org/dataset-name", "split": "train", "sample_rows": 3})
+# 5. Validate datasets — UC tables ingested from HF go via uc_inspect_dataset
+uc_inspect_dataset({"operation": "describe", "table": "ml_intern.agent.alpaca"})
 
 # 6. Now get working code for the training method
 github_find_examples({"repo": "trl", "keyword": "sft"})
@@ -182,7 +182,7 @@ RESEARCH_TOOL_SPEC = {
         "- Exploring HF docs, reading papers, analyzing GitHub repos\n"
         "- Any research where raw tool outputs would be too verbose\n\n"
         "The sub-agent knows how to use github_find_examples, github_read_file, "
-        "explore_hf_docs, fetch_hf_docs, hf_inspect_dataset, hf_papers, etc. "
+        "explore_hf_docs, fetch_hf_docs, uc_inspect_dataset, hf_papers, etc. "
         "Just describe what you need researched."
     ),
     "parameters": {
