@@ -9,8 +9,14 @@
 # granting broad workspace permissions.
 
 command:
-  - bash
-  - backend/start.sh
+  - uvicorn
+  - main:app
+  - --app-dir
+  - backend
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8000"
 
 env:
   - name: ML_INTERN_BACKEND
@@ -20,15 +26,15 @@ env:
   - name: MLFLOW_REGISTRY_URI
     value: databricks-uc
   - name: PYTHONPATH
-    value: /app
+    value: /app/python/source_code
   - name: ML_INTERN_UC_CATALOG
-    valueFrom: uc_catalog
+    value: serverless_lakebase_praneeth_catalog
   - name: ML_INTERN_UC_SCHEMA
-    valueFrom: uc_schema
+    value: ml_intern_test
   - name: DATABRICKS_WAREHOUSE_ID
-    valueFrom: sql_warehouse
+    value: 4d39ac2e32b72a3a
   - name: ML_INTERN_LAKEBASE_INSTANCE
-    valueFrom: lakebase
+    value: ml-intern-state
 
 # User OBO scopes — tool calls made on behalf of the end user carry these
 # scopes. Admin-only operations (bootstrap, schema creation) run as the App
@@ -42,44 +48,6 @@ user_authorization:
     - catalog.connections
     - workspace.workspace
 
-# Declared app resources. Bundle deploy binds each to the App and grants the
-# App service principal the listed permissions.
-resources:
-  - name: serving_endpoint
-    description: Default chat model (Foundation Model via AI Gateway)
-    serving_endpoint:
-      name: databricks-claude-opus-4
-      permission: CAN_QUERY
-
-  - name: sql_warehouse
-    description: Serverless SQL warehouse for UC reads
-    sql_warehouse:
-      id: ${var.warehouse_id}
-      permission: CAN_USE
-
-  - name: uc_catalog
-    description: Catalog for agent artifacts + telemetry
-    uc_securable:
-      securable_full_name: ${var.uc_catalog}
-      securable_type: CATALOG
-      permission: USE_CATALOG
-
-  - name: uc_schema
-    description: Schema for registered models, prompts, volumes
-    uc_securable:
-      securable_full_name: ${var.uc_catalog}.${var.uc_schema}
-      securable_type: SCHEMA
-      permission: ALL_PRIVILEGES
-
-  - name: secret_scope
-    description: Scope holding user GitHub tokens and optional external-model keys
-    secret:
-      scope: ${var.secret_scope}
-      key: placeholder
-      permission: READ
-
-  - name: lakebase
-    description: Session state + quotas
-    database:
-      instance_name: ${var.lakebase_instance}
-      permission: CAN_CONNECT_AND_CREATE
+# Resource bindings (serving endpoint, SQL warehouse, UC, secrets, Lakebase)
+# are wired post-deploy via the Apps console — bundle does not interpolate
+# ${var.*} inside app.yaml, so values can't be templated here.

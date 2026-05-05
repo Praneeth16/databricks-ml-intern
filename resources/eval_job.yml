@@ -22,19 +22,13 @@ resources:
               - "{{job.parameters.model}}"
               - --version
               - "{{job.parameters.version}}"
-          new_cluster:
-            spark_version: ${var.runtime_ml_gpu}
-            num_workers: 0
-            # Set ``instance_pool_id`` here once scripts/bootstrap_pool.py
-            # has run and the pool id is known; otherwise the cluster
-            # provisions on-demand at the configured node type.
-            node_type_id: ${var.node_type_gpu}
-            spark_conf:
-              spark.databricks.cluster.profile: singleNode
-              spark.master: "local[*]"
-            custom_tags:
-              ml_intern_purpose: model-eval
-              ResourceClass: SingleNode
+          environment_key: eval_env
+      environments:
+        - environment_key: eval_env
+          spec:
+            client: "1"
+            dependencies:
+              - mlflow[databricks]>=2.21
       parameters:
         - name: model
           default: ml_intern.agent.placeholder

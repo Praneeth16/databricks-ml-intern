@@ -49,32 +49,25 @@ resources:
       source_code_path: ./
       # app.yaml is auto-picked up from source_code_path.
 
+  # Catalog must already exist — bundle does not create it (catalog resources
+  # require the direct-deployment engine). Pass an existing catalog via
+  # ``--var uc_catalog=<name>`` or set the default below.
   schemas:
     ml_intern_agent:
       catalog_name: ${var.uc_catalog}
       name: ${var.uc_schema}
       comment: Registered models, prompts, and session artifacts for ml-intern.
-      grants:
-        - principal: ${resources.apps.ml_intern.service_principal_name}
-          privileges:
-            - USE_SCHEMA
-            - CREATE_MODEL
-            - CREATE_VOLUME
-            - CREATE_TABLE
-            - CREATE_FUNCTION
-            - MODIFY
-            - SELECT
+      # UC grants for the App SP are applied out-of-band after deploy — bundle
+      # dev mode prefixes the App name, which mangles the principal lookup.
+      # See README / bootstrap scripts for the exact GRANT statements.
 
   volumes:
     ml_intern_scratch:
       catalog_name: ${var.uc_catalog}
-      schema_name: ${var.uc_schema}
+      schema_name: ${resources.schemas.ml_intern_agent.name}
       name: ${var.uc_volume}
       volume_type: MANAGED
       comment: Scratch + session artifacts for ml-intern.
-      grants:
-        - principal: ${resources.apps.ml_intern.service_principal_name}
-          privileges: [READ_VOLUME, WRITE_VOLUME]
 
 targets:
   # Workspace host comes from the DATABRICKS_HOST env var (bundle does not
