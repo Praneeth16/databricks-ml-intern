@@ -26,11 +26,19 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import os
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
+# Per-span attribute key MLflow's exporter checks first when resolving the
+# trace's experiment binding (see mlflow.tracing.utils.get_experiment_id_for_trace).
+# Hard-coded so we don't depend on importing ``mlflow.tracing.constant`` at
+# init-time on builds that lack it.
+_EXPERIMENT_ID_ATTR = "mlflow.experimentId"
+
 _INITIALIZED = False
+_EXPERIMENT_ID: str | None = None
 
 
 def init_tracing(experiment_path: str | None) -> bool:
@@ -39,8 +47,16 @@ def init_tracing(experiment_path: str | None) -> bool:
     Returns True if the configuration succeeded so callers can decide whether
     to skip span emission entirely. Failure (no host, no auth, network error)
     is logged at WARNING once and never raised.
+
+    Beyond the tracking-URI + active-experiment setup, this binds the
+    experiment id explicitly through every channel the MLflow tracing
+    exporter might consult (``MLFLOW_EXPERIMENT_ID`` env var and, on builds
+    that ship it, ``mlflow.tracing.set_destination``). Without that the
+    v3 exporter logs ``trace_info.mlflow_experiment.experiment_id is
+    missing`` for every flushed span — a span written outside an active
+    ``start_run`` (the agent's normal case) has no run_id to anchor on.
     """
-    global _INITIALIZED
+    global _INITIALIZED, _EXPERIMENT_ID
     if _INITIALIZED:
         return True
     if not experiment_path:
@@ -50,13 +66,66 @@ def init_tracing(experiment_path: str | None) -> bool:
 
         mlflow.set_tracking_uri("databricks")
         mlflow.set_registry_uri("databricks-uc")
-        mlflow.set_experiment(experiment_path)
+        experiment = mlflow.set_experiment(experiment_path)
+        exp_id = getattr(experiment, "experiment_id", None)
+        if exp_id:
+            _EXPERIMENT_ID = str(exp_id)
+        _bind_tracing_destination(experiment)
         _INITIALIZED = True
         logger.info("MLflow Tracing initialised at experiment=%s", experiment_path)
         return True
     except Exception as e:
         logger.warning("MLflow Tracing init failed (%s) — running without traces.", e)
         return False
+
+
+def _bind_tracing_destination(experiment) -> None:
+    """Pin trace export to ``experiment``'s id via env var + tracing API.
+
+    Best-effort: any failure is logged at debug and tracing falls back to
+    the active experiment lookup the exporter would have done anyway.
+    """
+    exp_id = getattr(experiment, "experiment_id", None)
+    if not exp_id:
+        return
+    os.environ["MLFLOW_EXPERIMENT_ID"] = str(exp_id)
+    try:
+        from mlflow.tracing import set_destination  # type: ignore
+
+        # Pick whichever destination class the installed MLflow ships.
+        # Order: newer (MLflow 3.5+) → older → Databricks-flavored.
+        dest = None
+        for mod, attr in (
+            ("mlflow.entities.trace_location", "MlflowExperimentLocation"),
+            ("mlflow.tracing.destination", "MlflowExperiment"),
+            ("mlflow.tracing.destination", "Databricks"),
+        ):
+            try:
+                cls = getattr(__import__(mod, fromlist=[attr]), attr)
+                dest = cls(experiment_id=str(exp_id))
+                break
+            except Exception:
+                continue
+        if dest is not None:
+            set_destination(dest)
+    except Exception as e:
+        logger.debug("set_destination(%s) suppressed: %s", exp_id, e)
+
+
+def _with_experiment_id(attributes: dict[str, Any] | None) -> dict[str, Any]:
+    """Stamp ``mlflow.experimentId`` onto a span's attributes when known.
+
+    The MLflow v3 trace exporter resolves the experiment binding through a
+    fallback chain (per-span attr → user destination → active run → active
+    experiment). Pinning the attribute makes the resolution deterministic
+    even for spans flushed by the async exporter after globals churn at
+    process exit — without it the backend rejects with
+    ``trace_info.mlflow_experiment.experiment_id is missing``.
+    """
+    out = dict(attributes or {})
+    if _EXPERIMENT_ID and _EXPERIMENT_ID_ATTR not in out:
+        out[_EXPERIMENT_ID_ATTR] = _EXPERIMENT_ID
+    return out
 
 
 @contextlib.contextmanager
@@ -68,7 +137,9 @@ def trace_span(name: str, attributes: dict[str, Any] | None = None):
     try:
         import mlflow
 
-        with mlflow.start_span(name=name, attributes=attributes or {}) as span:
+        with mlflow.start_span(
+            name=name, attributes=_with_experiment_id(attributes),
+        ) as span:
             yield span
     except Exception as e:
         logger.debug("trace_span(%s) suppressed: %s", name, e)
@@ -89,7 +160,10 @@ def traced(name: str | None = None):
                     return await fn(*args, **kwargs)
                 try:
                     import mlflow
-                    with mlflow.start_span(name=name or fn.__name__):
+                    with mlflow.start_span(
+                        name=name or fn.__name__,
+                        attributes=_with_experiment_id(None),
+                    ):
                         return await fn(*args, **kwargs)
                 except Exception:
                     return await fn(*args, **kwargs)
@@ -101,7 +175,10 @@ def traced(name: str | None = None):
                 return fn(*args, **kwargs)
             try:
                 import mlflow
-                with mlflow.start_span(name=name or fn.__name__):
+                with mlflow.start_span(
+                    name=name or fn.__name__,
+                    attributes=_with_experiment_id(None),
+                ):
                     return fn(*args, **kwargs)
             except Exception:
                 return fn(*args, **kwargs)
@@ -116,5 +193,7 @@ def _is_coro(fn: Callable[..., Any]) -> bool:
 
 def reset_for_tests() -> None:
     """Test hook: forget initialisation so the next call re-runs."""
-    global _INITIALIZED
+    global _INITIALIZED, _EXPERIMENT_ID
     _INITIALIZED = False
+    _EXPERIMENT_ID = None
+    os.environ.pop("MLFLOW_EXPERIMENT_ID", None)

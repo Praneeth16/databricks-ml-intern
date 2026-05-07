@@ -176,6 +176,71 @@ def _experiment_url(host: str, experiment_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Notebook stdout-capture wrapper
+# ---------------------------------------------------------------------------
+#
+# serverless_gpu jobs run via ``notebook_task``. The Jobs ``runs/get-output``
+# endpoint returns ``notebook_output.result`` (the value of
+# ``dbutils.notebook.exit(...)``) for notebook tasks — *not* stdout. Without a
+# wrapper, ``logs`` op returns an empty string after a successful serverless_gpu
+# run and the agent has to round-trip through MLflow to learn what happened.
+#
+# The wrapper tees ``sys.stdout``/``sys.stderr`` into an in-memory buffer and,
+# on natural script exit, calls ``dbutils.notebook.exit`` with the last 4 KB so
+# ``runs/get-output`` carries the tail. If the user's script already calls
+# ``dbutils.notebook.exit`` (a textual check), we leave that path untouched —
+# their explicit exit value wins.
+
+_NOTEBOOK_STDOUT_WRAPPER_PRELUDE = '''\
+import sys as _ml_sys, io as _ml_io
+_ML_INTERN_BUF = _ml_io.StringIO()
+class _ML_INTERN_TEE:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, b):
+        for s in self._streams:
+            try: s.write(b)
+            except Exception: pass
+        return len(b) if isinstance(b, str) else 0
+    def flush(self):
+        for s in self._streams:
+            try: s.flush()
+            except Exception: pass
+    def isatty(self):
+        return False
+_ml_sys.stdout = _ML_INTERN_TEE(_ml_sys.__stdout__, _ML_INTERN_BUF)
+_ml_sys.stderr = _ML_INTERN_TEE(_ml_sys.__stderr__, _ML_INTERN_BUF)
+'''
+
+
+def _wrap_user_script_with_stdout_capture(script: str) -> str:
+    """Append a ``dbutils.notebook.exit`` finalizer that surfaces stdout tail.
+
+    Skipped when the user's script already calls ``dbutils.notebook.exit``
+    so we don't override an intentional exit value mid-flow.
+    """
+    if "dbutils.notebook.exit" in script:
+        return script
+    import textwrap
+    return (
+        "try:\n"
+        + textwrap.indent(script, "    ")
+        + "\nexcept BaseException as _ml_intern_err:\n"
+        "    _ml_tail = _ML_INTERN_BUF.getvalue()[-4000:]\n"
+        "    try:\n"
+        "        dbutils.notebook.exit(_ml_tail + '\\n[ml-intern] error: ' + repr(_ml_intern_err))\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    raise\n"
+        "else:\n"
+        "    try:\n"
+        "        dbutils.notebook.exit(_ML_INTERN_BUF.getvalue()[-4000:])\n"
+        "    except Exception:\n"
+        "        pass\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool implementation
 # ---------------------------------------------------------------------------
 
@@ -383,14 +448,19 @@ class DatabricksJobsTool:
         """Return the workspace path the job will execute.
 
         ``workspace_path`` is trusted as-is. Inline ``script`` content
-        stages to ``/Workspace/Users/<user>/ml-intern/<session>/<filename>``.
+        stages to ``/Workspace/Users/<user>/ml-intern/<session>/<subdir>/<filename>``,
+        where ``<subdir>`` is ``notebooks`` for ``as_notebook=True`` and
+        ``files`` otherwise. The split avoids the workspace API's hard
+        rejection when re-uploading the same path with a different
+        ``object_type`` (FILE vs NOTEBOOK) — the agent commonly reuses the
+        default ``train.py`` filename across kinds.
 
         ``as_notebook=True`` (serverless GPU / AI Runtime path) prepends
-        the Databricks notebook source magic and uploads via the workspace
-        import API as ``format=SOURCE`` so the file becomes a runnable
-        notebook. ``as_notebook=False`` (script / serverless CPU path) uses
-        ``format=AUTO`` so the file lands as a plain Python file readable
-        by ``spark_python_task``.
+        the Databricks notebook source magic plus a stdout-buffering
+        wrapper and uploads via the workspace import API as
+        ``format=SOURCE``. ``as_notebook=False`` (script / serverless CPU
+        path) uses ``format=AUTO`` so the file lands as a plain Python
+        file readable by ``spark_python_task``.
         """
         if args.get("workspace_path"):
             return args["workspace_path"]
@@ -407,18 +477,58 @@ class DatabricksJobsTool:
             (getattr(self.session, "session_id", None) or "")[:24],
             default=uuid.uuid4().hex[:12],
         )
-        path = f"/Workspace/Users/{self.user_email or 'user'}/ml-intern/{sid}/{filename}"
+        subdir = "notebooks" if as_notebook else "files"
+        path = (
+            f"/Workspace/Users/{self.user_email or 'user'}/ml-intern/"
+            f"{sid}/{subdir}/{filename}"
+        )
 
         if as_notebook:
             # Imported with format=SOURCE + language=PYTHON; Databricks keeps
             # the full filename (incl. ``.py``) as the notebook's workspace
             # path. notebook_task.notebook_path matches that filename verbatim.
-            content = f"# Databricks notebook source\n{script}"
+            content = (
+                "# Databricks notebook source\n"
+                + _NOTEBOOK_STDOUT_WRAPPER_PRELUDE
+                + _wrap_user_script_with_stdout_capture(script)
+            )
             await self._upload_workspace_notebook(path, content)
             return path
 
         await self._upload_workspace_file(path, script)
         return path
+
+    def _clear_if_wrong_type(self, ws_path: str, wanted: str) -> None:
+        """Delete the Workspace asset at ``ws_path`` when its ``object_type``
+        doesn't match ``wanted`` (one of ``"FILE"``, ``"NOTEBOOK"``).
+
+        ``/api/2.0/workspace/import`` with ``overwrite=True`` only overwrites
+        objects of the same type — re-uploading ``train.py`` as a FILE when a
+        prior call landed it as a NOTEBOOK fails with
+        ``InvalidParameterValue: type mismatch``. Probe the path, delete on
+        mismatch, swallow not-found / probe failures (the caller's import will
+        surface any real error).
+        """
+        try:
+            existing = self.wc.workspace.get_status(ws_path)
+        except Exception as e:
+            logger.debug("get_status(%s) suppressed: %s", ws_path, e)
+            return
+        existing_type = getattr(existing, "object_type", None)
+        # SDK enum (.name) or plain string — both end up uppercased.
+        existing_name = (
+            getattr(existing_type, "name", None) or str(existing_type or "")
+        ).upper()
+        if not existing_name or wanted in existing_name:
+            return
+        try:
+            self.wc.workspace.delete(ws_path, recursive=False)
+            logger.debug(
+                "Cleared %s at %s before re-upload as %s",
+                existing_name, ws_path, wanted,
+            )
+        except Exception as e:
+            logger.debug("delete(%s) suppressed: %s", ws_path, e)
 
     async def _upload_workspace_file(self, path: str, content: str) -> None:
         """Upload a plain Python file to a Workspace path.
@@ -435,7 +545,10 @@ class DatabricksJobsTool:
 
         We strip a workspace-relative path (drop ``/Workspace`` prefix) and
         send base64 content. The parent dir is created with mkdirs first
-        because workspace/import doesn't auto-create parents.
+        because workspace/import doesn't auto-create parents. If a NOTEBOOK
+        already lives at this path (e.g. from a prior serverless_gpu run that
+        reused the default ``train.py``) we delete it first to dodge the
+        ``type mismatch`` rejection.
         """
         import base64
 
@@ -449,6 +562,7 @@ class DatabricksJobsTool:
                 self.wc.workspace.mkdirs(parent)
             except Exception as e:
                 logger.debug("mkdirs(%s) suppressed: %s", parent, e)
+            self._clear_if_wrong_type(ws_path, wanted="FILE")
             self.wc.api_client.do(
                 "POST", "/api/2.0/workspace/import",
                 body={
@@ -467,6 +581,8 @@ class DatabricksJobsTool:
         Uses ``format=SOURCE`` + ``language=PYTHON`` so Databricks lands the
         file as a notebook bound to ``notebook_task.notebook_path``. The path
         is stripped of its ``.py`` suffix when referenced from the task body.
+        Pre-deletes any FILE asset already at the path so cross-kind reuse
+        doesn't trip ``InvalidParameterValue: type mismatch``.
         """
         import base64
 
@@ -479,6 +595,7 @@ class DatabricksJobsTool:
                 self.wc.workspace.mkdirs(parent)
             except Exception as e:
                 logger.debug("mkdirs(%s) suppressed: %s", parent, e)
+            self._clear_if_wrong_type(ws_path, wanted="NOTEBOOK")
             self.wc.api_client.do(
                 "POST", "/api/2.0/workspace/import",
                 body={

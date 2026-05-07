@@ -47,6 +47,10 @@ def _mock_wc():
     wc.api_client.do = MagicMock()
     wc.workspace.mkdirs = MagicMock()
     wc.workspace.upload = MagicMock()
+    # Default: nothing exists at the target path. Tests that exercise the
+    # type-collision codepath replace this side_effect locally.
+    wc.workspace.get_status = MagicMock(side_effect=Exception("not found"))
+    wc.workspace.delete = MagicMock()
     return wc
 
 
@@ -190,9 +194,12 @@ async def test_resolve_or_stage_script_uploads_inline_to_volume():
     import base64
 
     path = await tool._resolve_or_stage_script({"script": "print('hi')"})
-    # Scripts stage to /Workspace/... via /api/2.0/workspace/import format=AUTO
-    # so spark_python_task can ``open()`` them as plain files.
+    # Scripts stage to /Workspace/.../files/<name> via /api/2.0/workspace/import
+    # format=AUTO so spark_python_task can ``open()`` them as plain files. The
+    # ``files/`` subdir keeps file uploads from colliding with notebook
+    # uploads from the serverless_gpu path under the same session id.
     assert path.startswith("/Workspace/Users/alice@ex.com/ml-intern/")
+    assert "/files/" in path
     assert path.endswith("/train.py")
     # Raw API call shape — POST to workspace/import with base64 content.
     posts = [c for c in wc.api_client.do.call_args_list
@@ -203,6 +210,160 @@ async def test_resolve_or_stage_script_uploads_inline_to_volume():
     assert body["format"] == "AUTO"
     assert body["overwrite"] is True
     assert base64.b64decode(body["content"]) == b"print('hi')"
+
+
+@pytest.mark.asyncio
+async def test_resolve_or_stage_script_notebook_path_uses_notebooks_subdir():
+    """``as_notebook=True`` lands under .../notebooks/<name> so a later FILE
+    upload of the same default filename in the same session can't collide
+    with the NOTEBOOK asset."""
+    wc = _mock_wc()
+    tool = djt.DatabricksJobsTool(
+        wc=wc, settings=_make_settings(), user_email="alice@ex.com",
+    )
+    tool.session = MagicMock()
+    tool.session.session_id = "abcd-1234-5678-9012"
+
+    path = await tool._resolve_or_stage_script(
+        {"script": "print('hi')"}, as_notebook=True,
+    )
+    assert path.startswith("/Workspace/Users/alice@ex.com/ml-intern/")
+    assert "/notebooks/" in path
+    assert path.endswith("/train.py")
+    posts = [c for c in wc.api_client.do.call_args_list
+             if c.args[0] == "POST" and c.args[1] == "/api/2.0/workspace/import"]
+    body = posts[0].kwargs["body"]
+    assert body["format"] == "SOURCE"
+    assert body["language"] == "PYTHON"
+
+
+@pytest.mark.asyncio
+async def test_notebook_upload_wraps_user_script_with_stdout_capture():
+    """Serverless GPU jobs use notebook_task; ``runs/get-output`` only
+    surfaces ``dbutils.notebook.exit`` for those, not stdout. The wrapper
+    must (a) tee stdout/stderr and (b) call ``dbutils.notebook.exit`` with
+    the captured tail when the user didn't already exit."""
+    import base64
+    wc = _mock_wc()
+    tool = djt.DatabricksJobsTool(
+        wc=wc, settings=_make_settings(), user_email="alice@ex.com",
+    )
+    tool.session = MagicMock()
+    tool.session.session_id = "abcd-1234-5678-9012"
+
+    await tool._resolve_or_stage_script(
+        {"script": "print('hello')"}, as_notebook=True,
+    )
+    posts = [c for c in wc.api_client.do.call_args_list
+             if c.args[0] == "POST" and c.args[1] == "/api/2.0/workspace/import"]
+    decoded = base64.b64decode(posts[0].kwargs["body"]["content"]).decode()
+    assert decoded.startswith("# Databricks notebook source\n")
+    assert "_ML_INTERN_BUF" in decoded
+    assert "_ML_INTERN_TEE" in decoded
+    assert "dbutils.notebook.exit(_ML_INTERN_BUF.getvalue()[-4000:])" in decoded
+    # User script is preserved inside the wrapper.
+    assert "print('hello')" in decoded
+
+
+@pytest.mark.asyncio
+async def test_notebook_upload_preserves_user_explicit_exit():
+    """If the user already calls ``dbutils.notebook.exit`` we must not
+    append a second exit — that would override their intentional value."""
+    import base64
+    wc = _mock_wc()
+    tool = djt.DatabricksJobsTool(
+        wc=wc, settings=_make_settings(), user_email="alice@ex.com",
+    )
+    tool.session = MagicMock()
+    tool.session.session_id = "abcd-1234-5678-9012"
+
+    user_script = "print('hi')\ndbutils.notebook.exit('user-value')"
+    await tool._resolve_or_stage_script(
+        {"script": user_script}, as_notebook=True,
+    )
+    posts = [c for c in wc.api_client.do.call_args_list
+             if c.args[0] == "POST" and c.args[1] == "/api/2.0/workspace/import"]
+    decoded = base64.b64decode(posts[0].kwargs["body"]["content"]).decode()
+    # User's exit kept verbatim.
+    assert "dbutils.notebook.exit('user-value')" in decoded
+    # Wrapper's auto-exit not added when user already exits.
+    assert "_ML_INTERN_BUF.getvalue()[-4000:]" not in decoded
+
+
+@pytest.mark.asyncio
+async def test_upload_workspace_file_clears_notebook_at_same_path():
+    """Repro for the type-mismatch InvalidParameterValue: when a NOTEBOOK
+    already lives at the target path, ``workspace/import`` with format=AUTO
+    rejects with a ``type mismatch``. The tool must delete the prior asset
+    before importing."""
+    wc = _mock_wc()
+    existing = MagicMock()
+    existing.object_type = MagicMock()
+    existing.object_type.name = "NOTEBOOK"
+    wc.workspace.get_status = MagicMock(return_value=existing)
+    wc.workspace.delete = MagicMock()
+
+    tool = djt.DatabricksJobsTool(
+        wc=wc, settings=_make_settings(), user_email="alice@ex.com",
+    )
+    tool.session = MagicMock()
+    tool.session.session_id = "s"
+
+    await tool._upload_workspace_file(
+        "/Workspace/Users/alice@ex.com/ml-intern/s/files/train.py",
+        "print('x')",
+    )
+    wc.workspace.delete.assert_called_once()
+    deleted_path = wc.workspace.delete.call_args.args[0]
+    assert deleted_path == "/Users/alice@ex.com/ml-intern/s/files/train.py"
+
+
+@pytest.mark.asyncio
+async def test_upload_workspace_notebook_clears_file_at_same_path():
+    """Mirror of the FILE-collision test for the serverless_gpu (notebook)
+    direction."""
+    wc = _mock_wc()
+    existing = MagicMock()
+    existing.object_type = MagicMock()
+    existing.object_type.name = "FILE"
+    wc.workspace.get_status = MagicMock(return_value=existing)
+    wc.workspace.delete = MagicMock()
+
+    tool = djt.DatabricksJobsTool(
+        wc=wc, settings=_make_settings(), user_email="alice@ex.com",
+    )
+    tool.session = MagicMock()
+    tool.session.session_id = "s"
+
+    await tool._upload_workspace_notebook(
+        "/Workspace/Users/alice@ex.com/ml-intern/s/notebooks/train.py",
+        "# Databricks notebook source\nprint('x')",
+    )
+    wc.workspace.delete.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_upload_workspace_file_skips_delete_when_type_matches():
+    """No delete when the existing asset is already the wanted type — the
+    overwrite=True flag on workspace/import handles same-type rewrites."""
+    wc = _mock_wc()
+    existing = MagicMock()
+    existing.object_type = MagicMock()
+    existing.object_type.name = "FILE"
+    wc.workspace.get_status = MagicMock(return_value=existing)
+    wc.workspace.delete = MagicMock()
+
+    tool = djt.DatabricksJobsTool(
+        wc=wc, settings=_make_settings(), user_email="alice@ex.com",
+    )
+    tool.session = MagicMock()
+    tool.session.session_id = "s"
+
+    await tool._upload_workspace_file(
+        "/Workspace/Users/alice@ex.com/ml-intern/s/files/train.py",
+        "print('x')",
+    )
+    wc.workspace.delete.assert_not_called()
 
 
 @pytest.mark.asyncio
