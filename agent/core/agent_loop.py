@@ -8,8 +8,14 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
-from litellm import ChatCompletionMessageToolCall, Message, acompletion
+from litellm import (
+    ChatCompletionMessageToolCall,
+    Message,
+    acompletion,
+    stream_chunk_builder,
+)
 from litellm.exceptions import ContextWindowExceededError
 
 from agent.config import Config
@@ -320,6 +326,77 @@ class LLMResult:
     token_count: int
     finish_reason: str | None
     usage: dict = field(default_factory=dict)
+    thinking_blocks: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None
+
+
+def _extract_thinking_state(
+    message: Any,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Return provider reasoning fields that must be replayed after tool calls."""
+    thinking_blocks = getattr(message, "thinking_blocks", None) or None
+    reasoning_content = getattr(message, "reasoning_content", None) or None
+    return thinking_blocks, reasoning_content
+
+
+def _should_replay_thinking_state(model_name: str | None) -> bool:
+    """Replay thinking metadata only for providers that accept it on input.
+
+    Upstream gated this to ``anthropic/...`` (direct Anthropic API).
+
+    Local extension: ``databricks/`` is also accepted, *but only when the
+    served model is Claude-backed*. Databricks Foundation Model API + AI
+    Gateway expose many models under the same prefix — Claude, Mistral,
+    DBRX, Qwen, etc. Only Claude accepts Anthropic-shape
+    ``thinking_blocks`` / ``reasoning_content`` on input messages; the
+    rest reject them and tool use breaks after the first turn (Codex
+    review caught this on the staged diff). We pattern-match the
+    served-model name segment for ``claude`` so the gate stays
+    schema-correct as new endpoints land.
+
+    OpenAI-compatible schemas (HF router, generic OpenAI) reject
+    ``reasoning_content`` in assistant history and fall through.
+    """
+    if not model_name:
+        return False
+    if model_name.startswith("anthropic/"):
+        return True
+    if model_name.startswith("databricks/"):
+        # databricks/<endpoint-name> — Claude endpoints all carry "claude"
+        # in the served-model name (e.g. databricks-claude-opus-4-7,
+        # databricks-claude-3-7-sonnet). Anything else is non-Claude and
+        # must not get Anthropic-shape replay metadata.
+        endpoint = model_name.split("/", 1)[1]
+        return "claude" in endpoint.lower()
+    return False
+
+
+def _assistant_message_from_result(
+    llm_result: LLMResult,
+    *,
+    model_name: str | None,
+    tool_calls: list[ChatCompletionMessageToolCall] | None = None,
+) -> Message:
+    """Build an assistant history message without dropping reasoning state.
+
+    Anthropic extended-thinking + tool use requires ``thinking_blocks``
+    from the prior assistant turn to be replayed on the next request,
+    otherwise the API returns "Invalid signature in thinking block".
+    Without this helper the loop rebuilt assistant history from only
+    ``content`` + ``tool_calls`` and LiteLLM stripped the metadata.
+    """
+    kwargs: dict[str, Any] = {
+        "role": "assistant",
+        "content": llm_result.content,
+    }
+    if tool_calls is not None:
+        kwargs["tool_calls"] = tool_calls
+    if _should_replay_thinking_state(model_name):
+        if llm_result.thinking_blocks:
+            kwargs["thinking_blocks"] = llm_result.thinking_blocks
+        if llm_result.reasoning_content:
+            kwargs["reasoning_content"] = llm_result.reasoning_content
+    return Message(**kwargs)
 
 
 async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> LLMResult:
@@ -370,8 +447,14 @@ async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> 
     token_count = 0
     finish_reason = None
     final_usage_chunk = None
+    # Buffered for stream_chunk_builder so we can rebuild thinking_blocks
+    # / reasoning_content for providers that accept replay on the next turn
+    # (Anthropic + Databricks FMAPI). Empty for everyone else — the cost
+    # is one list reference per call.
+    chunks: list[Any] = []
 
     async for chunk in response:
+        chunks.append(chunk)
         if session.is_cancelled:
             tool_calls_acc.clear()
             break
@@ -421,12 +504,30 @@ async def _call_llm_streaming(session: Session, messages, tools, llm_params) -> 
         finish_reason=finish_reason,
     )
 
+    # Recover thinking_blocks + reasoning_content from the streamed chunks
+    # for replay on the next turn. ``stream_chunk_builder`` reassembles
+    # the full message envelope including provider reasoning fields that
+    # don't surface in the per-chunk delta. Gated by provider — see
+    # ``_should_replay_thinking_state``.
+    thinking_blocks = None
+    reasoning_content = None
+    if chunks and _should_replay_thinking_state(llm_params.get("model")):
+        try:
+            rebuilt = stream_chunk_builder(chunks, messages=messages)
+            if rebuilt and getattr(rebuilt, "choices", None):
+                rebuilt_msg = rebuilt.choices[0].message
+                thinking_blocks, reasoning_content = _extract_thinking_state(rebuilt_msg)
+        except Exception:
+            logger.debug("Failed to rebuild streaming thinking state", exc_info=True)
+
     return LLMResult(
         content=full_content or None,
         tool_calls_acc=tool_calls_acc,
         token_count=token_count,
         finish_reason=finish_reason,
         usage=usage,
+        thinking_blocks=thinking_blocks,
+        reasoning_content=reasoning_content,
     )
 
 
@@ -477,6 +578,7 @@ async def _call_llm_non_streaming(session: Session, messages, tools, llm_params)
     content = message.content or None
     finish_reason = choice.finish_reason
     token_count = response.usage.total_tokens if response.usage else 0
+    thinking_blocks, reasoning_content = _extract_thinking_state(message)
 
     # Build tool_calls_acc in the same format as streaming
     tool_calls_acc: dict[int, dict] = {}
@@ -511,6 +613,8 @@ async def _call_llm_non_streaming(session: Session, messages, tools, llm_params)
         token_count=token_count,
         finish_reason=finish_reason,
         usage=usage,
+        thinking_blocks=thinking_blocks,
+        reasoning_content=reasoning_content,
     )
 
 
@@ -679,7 +783,9 @@ class Handlers:
                         "  • For other tools: reduce the size of your arguments or use bash."
                     )
                     if content:
-                        assistant_msg = Message(role="assistant", content=content)
+                        assistant_msg = _assistant_message_from_result(
+                            llm_result, model_name=llm_params.get("model"),
+                        )
                         session.context_manager.add_message(assistant_msg, token_count)
                     session.context_manager.add_message(
                         Message(role="user", content=f"[SYSTEM: {truncation_hint}]")
@@ -735,7 +841,9 @@ class Handlers:
                         (content or "")[:500],
                     )
                     if content:
-                        assistant_msg = Message(role="assistant", content=content)
+                        assistant_msg = _assistant_message_from_result(
+                            llm_result, model_name=llm_params.get("model"),
+                        )
                         session.context_manager.add_message(assistant_msg, token_count)
                         final_response = content
                     break
@@ -756,10 +864,16 @@ class Handlers:
                         tc.function.arguments = "{}"
                         bad_tools.append(tc)
 
-                # Add assistant message with all tool calls to context
-                assistant_msg = Message(
-                    role="assistant",
-                    content=content,
+                # Add assistant message with all tool calls to context.
+                # Routed through ``_assistant_message_from_result`` so
+                # thinking_blocks / reasoning_content survive on providers
+                # that need them replayed on the next turn (Anthropic +
+                # Databricks FMAPI). Without this the next request fails
+                # with "Invalid signature in thinking block" under
+                # extended-thinking + tool-use.
+                assistant_msg = _assistant_message_from_result(
+                    llm_result,
+                    model_name=llm_params.get("model"),
                     tool_calls=tool_calls,
                 )
                 session.context_manager.add_message(assistant_msg, token_count)
