@@ -134,9 +134,67 @@ function formatResearchStep(raw: string): { label: string } {
     const page = url.split('/').pop()?.replace(/\.md$/, '');
     return { label: page ? `Reading docs: ${page}` : 'Fetching docs' };
   }
-  if (step.startsWith('hf_inspect_dataset')) {
-    const dataset = (args.dataset);
-    return { label: dataset ? `Inspecting dataset: ${dataset}` : 'Inspecting dataset' };
+  if (step.startsWith('uc_inspect_dataset')) {
+    const op = args.operation as string;
+    const detail = (args.table) || (args.catalog) || (args.schema);
+    const opLabels: Record<string, string> = {
+      list_tables: 'Listing UC tables',
+      describe: 'Describing UC table',
+      sample: 'Sampling UC table',
+      query: 'Querying UC table',
+    };
+    const base = (op && opLabels[op]) || 'Inspecting UC dataset';
+    return { label: detail ? `${base}: ${detail}` : base };
+  }
+  if (step.startsWith('uc_volume')) {
+    const op = args.operation as string;
+    const path = (args.path) || '';
+    const opLabels: Record<string, string> = {
+      read: 'Reading volume file',
+      write: 'Writing volume file',
+      ls: 'Listing volume',
+      rm: 'Removing volume file',
+      mkdir: 'Creating volume dir',
+    };
+    const base = (op && opLabels[op]) || 'UC volume op';
+    return { label: path ? `${base}: ${path}` : base };
+  }
+  if (step.startsWith('uc_model')) {
+    const op = args.operation as string;
+    const name = (args.name) || (args.full_name);
+    const opLabels: Record<string, string> = {
+      list: 'Listing UC models',
+      inspect: 'Inspecting UC model',
+      list_versions: 'Listing model versions',
+      set_alias: 'Setting model alias',
+      delete_alias: 'Deleting model alias',
+    };
+    const base = (op && opLabels[op]) || 'UC model op';
+    return { label: name ? `${base}: ${name}` : base };
+  }
+  if (step.startsWith('hf_to_uc')) {
+    const op = args.operation as string;
+    const src = (args.repo_id) || (args.dataset_id) || (args.model_id);
+    const opLabels: Record<string, string> = {
+      ingest_dataset: 'Ingesting HF dataset → UC',
+      ingest_model: 'Ingesting HF model → UC',
+      ingest_file: 'Ingesting HF file → UC',
+    };
+    const base = (op && opLabels[op]) || 'Ingesting HF → UC';
+    return { label: src ? `${base}: ${src}` : base };
+  }
+  if (step.startsWith('repos')) {
+    const op = args.operation as string;
+    const url = (args.url) || (args.path);
+    const opLabels: Record<string, string> = {
+      clone: 'Cloning repo',
+      list: 'Listing repos',
+      inspect: 'Inspecting repo',
+      pull: 'Pulling repo',
+      delete: 'Deleting repo',
+    };
+    const base = (op && opLabels[op]) || 'Repo op';
+    return { label: url ? `${base}: ${url}` : base };
   }
   if (step.startsWith('hf_papers')) {
     const op = args.operation as string;
@@ -160,10 +218,6 @@ function formatResearchStep(raw: string): { label: string } {
   if (step.startsWith('find_hf_api')) {
     const detail = (args.query) || (args.tag);
     return { label: detail ? `Finding API: ${detail}` : 'Finding API endpoints' };
-  }
-  if (step.startsWith('hf_repo_files')) {
-    const repo = (args.repo_id) || (args.repo);
-    return { label: repo ? `Reading ${repo} files` : 'Reading repo files' };
   }
   if (step.startsWith('read')) {
     const path = (args.path) || '';
@@ -221,7 +275,7 @@ function ResearchSteps({ steps }: { steps: string[] }) {
 }
 
 // ---------------------------------------------------------------------------
-// Hardware pricing ($/hr) — from HF Spaces & Jobs pricing
+// Hardware pricing ($/hr) — approximate cluster compute cost reference
 // ---------------------------------------------------------------------------
 const HARDWARE_PRICING: Record<string, string> = {
   'cpu-basic': 'free',
@@ -319,7 +373,7 @@ function InlineApproval({
   const hasEditedScript = !!getEditedScript(toolCallId);
 
   const handleScriptClick = useCallback(() => {
-    if (toolName === 'hf_jobs' && args?.script) {
+    if (toolName === 'databricks_jobs' && args?.script) {
       const scriptContent = getEditedScript(toolCallId) || String(args.script);
       setPanel(
         { title: scriptLabel, script: { content: scriptContent, language: 'python' }, parameters: { tool_call_id: toolCallId } },
@@ -353,13 +407,13 @@ function InlineApproval({
               )}
             </Typography>
             <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.7rem', opacity: 0.7 }}>
-              Creates a temporary HF Space to develop and test scripts before running jobs. Takes 1-2 min to start.
+              Probes Databricks compute (serverless GPU → pool cluster → on-demand) for an interactive sandbox. Takes 1-2 min to start.
             </Typography>
           </Box>
         );
       })()}
 
-      {toolName === 'hf_jobs' && args && (() => {
+      {toolName === 'databricks_jobs' && args && (() => {
         const hw = String(args.hardware_flavor || 'cpu-basic');
         const cost = costLabel(hw);
         return (
@@ -590,17 +644,17 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
   }, [tools, setToolError, getToolError]);
 
   const { scriptLabelMap, toolDisplayMap } = useMemo(() => {
-    const hfJobs = tools.filter(t => t.toolName === 'hf_jobs' && (t.input as Record<string, unknown>)?.script);
+    const hfJobs = tools.filter(t => t.toolName === 'databricks_jobs' && (t.input as Record<string, unknown>)?.script);
     const scriptMap: Record<string, string> = {};
     const displayMap: Record<string, string> = {};
     for (let i = 0; i < hfJobs.length; i++) {
       const id = hfJobs[i].toolCallId;
       if (hfJobs.length > 1) {
         scriptMap[id] = `Script ${i + 1}`;
-        displayMap[id] = `hf_jobs #${i + 1}`;
+        displayMap[id] = `databricks_jobs #${i + 1}`;
       } else {
         scriptMap[id] = 'Script';
-        displayMap[id] = 'hf_jobs';
+        displayMap[id] = 'databricks_jobs';
       }
     }
     // Pretty name for research tool
@@ -689,7 +743,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       const args = tool.input as Record<string, unknown> | undefined;
       const displayName = toolDisplayMap[tool.toolCallId] || tool.toolName;
 
-      if (tool.toolName === 'hf_jobs' && args?.script) {
+      if (tool.toolName === 'databricks_jobs' && args?.script) {
         const jobOutput = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
         const hasOutput = (tool.state === 'output-available' || tool.state === 'output-error') && jobOutput;
         const scriptContent = getEditedScript(tool.toolCallId) || String(args.script);
@@ -794,7 +848,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     }
   }, [tools, lockedToolId, showToolPanel]);
 
-  // ── Parse hf_jobs metadata from output ────────────────────────────
+  // ── Parse databricks_jobs metadata from output ────────────────────────────
   function parseJobMeta(output: unknown): { jobUrl?: string; jobStatus?: string } {
     if (typeof output !== 'string') return {};
     const urlMatch = output.match(/\*\*View at:\*\*\s*(https:\/\/[^\s\n]+)/);
@@ -902,16 +956,16 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             : hasError ? 'error'
             : statusLabel(displayState as ToolPartState);
 
-          // Parse job metadata from hf_jobs output and store
-          const jobUrlFromStore = tool.toolName === 'hf_jobs' ? getJobUrl(tool.toolCallId) : undefined;
-          const jobStatusFromStore = tool.toolName === 'hf_jobs' ? getJobStatus(tool.toolCallId) : undefined;
+          // Parse job metadata from databricks_jobs output and store
+          const jobUrlFromStore = tool.toolName === 'databricks_jobs' ? getJobUrl(tool.toolCallId) : undefined;
+          const jobStatusFromStore = tool.toolName === 'databricks_jobs' ? getJobStatus(tool.toolCallId) : undefined;
 
-          const jobMetaFromOutput = tool.toolName === 'hf_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
+          const jobMetaFromOutput = tool.toolName === 'databricks_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
             ? parseJobMeta(tool.output ?? (tool as Record<string, unknown>).errorText)
             : {};
 
           // Store job status if we just parsed it and don't have it stored yet
-          if (tool.toolName === 'hf_jobs' && jobMetaFromOutput.jobStatus && !jobStatusFromStore) {
+          if (tool.toolName === 'databricks_jobs' && jobMetaFromOutput.jobStatus && !jobStatusFromStore) {
             setJobStatus(tool.toolCallId, jobMetaFromOutput.jobStatus);
           }
 
@@ -946,7 +1000,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   state={
                     hasError
                       ? 'output-error'
-                      : ((tool.toolName === 'hf_jobs' && jobMeta.jobStatus && ['ERROR', 'FAILED', 'CANCELLED'].includes(jobMeta.jobStatus))
+                      : ((tool.toolName === 'databricks_jobs' && jobMeta.jobStatus && ['ERROR', 'FAILED', 'CANCELLED'].includes(jobMeta.jobStatus))
                         ? 'output-error'
                         : displayState as ToolPartState)
                   }
@@ -969,7 +1023,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   {toolDisplayMap[tool.toolCallId] || tool.toolName}
                 </Typography>
 
-                {/* Status chip (non hf_jobs, or hf_jobs without final status) */}
+                {/* Status chip (non databricks_jobs, or databricks_jobs without final status) */}
                 {(() => {
                   // Research tool: override chip label with this card's agent stats
                   const agentState: ResearchAgentState | undefined = tool.toolName === 'research'
@@ -983,7 +1037,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                         : researchChipLabel(agentState.stats, liveElapsed))
                     : null;
                   const chipLabel = researchLabel || label;
-                  if (!chipLabel || (tool.toolName === 'hf_jobs' && jobMeta.jobStatus)) return null;
+                  if (!chipLabel || (tool.toolName === 'databricks_jobs' && jobMeta.jobStatus)) return null;
 
                   return (
                     <Chip
@@ -1006,8 +1060,8 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   );
                 })()}
 
-                {/* HF Jobs: final status chip from job metadata */}
-                {tool.toolName === 'hf_jobs' && jobMeta.jobStatus && (
+                {/* Databricks Jobs: final status chip from job metadata */}
+                {tool.toolName === 'databricks_jobs' && jobMeta.jobStatus && (
                   <Chip
                     label={jobMeta.jobStatus}
                     size="small"
@@ -1030,8 +1084,8 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   />
                 )}
 
-                {/* View on HF link — single place, shown whenever URL is available */}
-                {tool.toolName === 'hf_jobs' && jobMeta.jobUrl && (
+                {/* View Run link — single place, shown whenever URL is available */}
+                {tool.toolName === 'databricks_jobs' && jobMeta.jobUrl && (
                   <Link
                     href={jobMeta.jobUrl}
                     target="_blank"
@@ -1049,7 +1103,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                     }}
                   >
                     <LaunchIcon sx={{ fontSize: 12 }} />
-                    View on HF
+                    View Run
                   </Link>
                 )}
 

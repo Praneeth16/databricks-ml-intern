@@ -85,16 +85,13 @@ class AgentSession:
     tool_router: ToolRouter
     submission_queue: asyncio.Queue
     user_id: str = "dev"  # Owner of this session
-    hf_token: str | None = None  # User's HF OAuth token for tool execution
+    databricks_user_token: str | None = None  # OBO from Apps proxy
+    user_email: str | None = None
     task: asyncio.Task | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     is_active: bool = True
     is_processing: bool = False  # True while a submission is being executed
     broadcaster: Any = None
-    # True once this session has been counted against the user's daily
-    # Claude quota. Guards double-counting when the user re-selects an
-    # Anthropic model mid-session.
-    claude_counted: bool = False
 
 
 class SessionCapacityError(Exception):
@@ -133,25 +130,22 @@ class SessionManager:
     async def create_session(
         self,
         user_id: str = "dev",
-        hf_token: str | None = None,
+        databricks_user_token: str | None = None,
+        user_email: str | None = None,
         model: str | None = None,
+        hf_token: str | None = None,
     ) -> str:
         """Create a new agent session and return its ID.
 
-        Session() and ToolRouter() constructors contain blocking I/O
-        (e.g. HfApi().whoami(), litellm.get_max_tokens()) so they are
-        executed in a thread pool to avoid freezing the async event loop.
-
-        Args:
-            user_id: The ID of the user who owns this session.
-            hf_token: The user's HF OAuth token, stored for tool execution.
-            model: Optional model override. When set, replaces ``model_name``
-                on the per-session config clone. None falls back to the
-                config default.
+        ``databricks_user_token`` is the OBO token forwarded by the Apps
+        proxy (``X-Forwarded-Access-Token``); it lets per-session tool
+        calls act as the end user instead of the App SP. ``hf_token`` is
+        kept around only because the research / HF-fallback tools still
+        consume it for read-only Hub access.
 
         Raises:
-            SessionCapacityError: If the server or user has reached the
-                maximum number of concurrent sessions.
+            SessionCapacityError: If the server or user has hit the
+                concurrent-session limit.
         """
         # ── Capacity checks ──────────────────────────────────────────
         async with self._lock:
@@ -186,13 +180,15 @@ class SessionManager:
             t0 = _time.monotonic()
             tool_router = ToolRouter(self.config.mcpServers, hf_token=hf_token)
             # Deep-copy config so each session's model switches independently —
-            # tab A picking GLM doesn't flip tab B off Claude.
+            # tab A picking GLM doesn't flip tab B off claude-opus-4.
             session_config = self.config.model_copy(deep=True)
             if model:
                 session_config.model_name = model
             session = Session(
                 event_queue, config=session_config, tool_router=tool_router,
                 hf_token=hf_token,
+                databricks_user_token=databricks_user_token,
+                user_email=user_email,
             )
             t1 = _time.monotonic()
             logger.info(f"Session initialized in {t1 - t0:.2f}s")
@@ -200,18 +196,28 @@ class SessionManager:
 
         tool_router, session = await asyncio.to_thread(_create_session_sync)
 
-        # Create wrapper
         agent_session = AgentSession(
             session_id=session_id,
             session=session,
             tool_router=tool_router,
             submission_queue=submission_queue,
             user_id=user_id,
-            hf_token=hf_token,
+            databricks_user_token=databricks_user_token,
+            user_email=user_email,
         )
 
         async with self._lock:
             self.sessions[session_id] = agent_session
+
+        # Best-effort persistence to Lakebase (no-op when not configured).
+        try:
+            import lakebase
+            lakebase.upsert_session(
+                session_id=session_id, user_id=user_id, user_email=user_email,
+                model_name=session.config.model_name, is_active=True,
+            )
+        except Exception as e:
+            logger.debug("Session persistence skipped: %s", e)
 
         # Start the agent loop task
         task = asyncio.create_task(
@@ -287,17 +293,20 @@ class SessionManager:
 
     @staticmethod
     async def _cleanup_sandbox(session: Session) -> None:
-        """Delete the sandbox Space if one was created for this session."""
+        """Tear down the per-session sandbox cluster, if any."""
         sandbox = getattr(session, "sandbox", None)
-        if sandbox and getattr(sandbox, "_owns_space", False):
-            space_id = getattr(sandbox, "space_id", None)
-            try:
-                logger.info(f"Deleting sandbox {space_id}...")
-                await asyncio.to_thread(sandbox.delete)
-                from agent.core import telemetry
-                await telemetry.record_sandbox_destroy(session, sandbox)
-            except Exception as e:
-                logger.warning(f"Failed to delete sandbox {space_id}: {e}")
+        if not sandbox:
+            return
+        owned = getattr(getattr(sandbox, "compute", None), "owns_cluster", False)
+        if not owned:
+            return
+        try:
+            logger.info("Deleting sandbox cluster %s…", getattr(sandbox, "cluster_id", "?"))
+            await asyncio.to_thread(sandbox.delete)
+            from agent.core import telemetry
+            await telemetry.record_sandbox_destroy(session, sandbox)
+        except Exception as e:
+            logger.warning("Failed to delete sandbox cluster: %s", e)
 
     async def _run_session(
         self,
@@ -359,18 +368,21 @@ class SessionManager:
 
             await self._cleanup_sandbox(session)
 
-            # Final-flush: always save on session death so we capture ended
-            # sessions even if the client disconnects without /shutdown.
-            # Idempotent via session_id key; detached subprocess.
             if session.config.save_sessions:
                 try:
-                    session.save_and_upload_detached(session.config.session_dataset_repo)
+                    session.save_trajectory_local()
                 except Exception as e:
                     logger.warning(f"Final-flush failed for {session_id}: {e}")
 
             async with self._lock:
                 if session_id in self.sessions:
                     self.sessions[session_id].is_active = False
+
+            try:
+                import lakebase
+                lakebase.mark_session_inactive(session_id)
+            except Exception as e:
+                logger.debug("mark_session_inactive skipped: %s", e)
 
             logger.info(f"Session {session_id} ended")
 

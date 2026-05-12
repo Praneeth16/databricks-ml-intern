@@ -13,13 +13,17 @@ from litellm import ChatCompletionMessageToolCall, Message, acompletion
 from litellm.exceptions import ContextWindowExceededError
 
 from agent.config import Config
-from agent.core import telemetry
+from agent.core import db_client, telemetry, tracing
 from agent.core.doom_loop import check_for_doom_loop
 from agent.core.llm_params import _resolve_llm_params
 from agent.core.prompt_caching import with_prompt_caching
 from agent.core.session import Event, OpType, Session
 from agent.core.tools import ToolRouter
-from agent.tools.jobs_tool import CPU_FLAVORS
+
+# CPU flavors that don't require explicit approval for the databricks_jobs
+# script kind. Anything else is GPU-class compute and goes through the
+# approval gate so the user sees it before launch.
+_CPU_FLAVORS = {"cpu-basic", "cpu-upgrade"}
 
 logger = logging.getLogger(__name__)
 
@@ -64,56 +68,44 @@ def _needs_approval(
     if tool_name == "sandbox_create":
         return True
 
-    if tool_name == "hf_jobs":
+    if tool_name == "databricks_jobs":
         operation = tool_args.get("operation", "")
-        if operation not in ["run", "uv", "scheduled run", "scheduled uv"]:
+        # Only the run / scheduled-run paths actually consume cluster compute.
+        if operation not in {"run", "scheduled run"}:
             return False
-
-        # Check if this is a CPU-only job
-        # hardware_flavor is at top level of tool_args, not nested in args
-        hardware_flavor = (
+        kind = (tool_args.get("kind") or "script").lower()
+        # Mosaic AI fine-tune always needs explicit user approval — GPU-bound,
+        # potentially many DBUs.
+        if kind == "finetune":
+            return True
+        # Script / serverless kinds: skip approval for explicit cpu flavors when
+        # the user has opted out of CPU confirmations. GPU jobs always confirm.
+        flavor = (
             tool_args.get("hardware_flavor")
             or tool_args.get("flavor")
-            or tool_args.get("hardware")
             or "cpu-basic"
         )
-        is_cpu_job = hardware_flavor in CPU_FLAVORS
-
+        is_cpu_job = flavor in _CPU_FLAVORS and not tool_args.get("node_type_id")
         if is_cpu_job:
-            if config and not config.confirm_cpu_jobs:
-                return False
-            return True
-
+            return bool(config and config.confirm_cpu_jobs)
         return True
 
-    # Check for file upload operations (hf_private_repos or other tools)
-    if tool_name == "hf_private_repos":
-        operation = tool_args.get("operation", "")
-        if operation == "upload_file":
-            if config and config.auto_file_upload:
-                return False
-            return True
-        # Other operations (create_repo, etc.) always require approval
-        if operation in ["create_repo"]:
-            return True
+    # uc_volume mutations land artifacts in durable storage; only the write/rm
+    # paths require approval (read/ls are free).
+    if tool_name == "uc_volume":
+        return tool_args.get("operation") in {"write", "rm"}
 
-    # hf_repo_files: upload (can overwrite) and delete require approval
-    if tool_name == "hf_repo_files":
-        operation = tool_args.get("operation", "")
-        if operation in ["upload", "delete"]:
-            return True
+    # repos: clone / pull / delete touch shared workspace state.
+    if tool_name == "repos":
+        return tool_args.get("operation") in {"clone", "delete", "pull"}
 
-    # hf_repo_git: destructive operations require approval
-    if tool_name == "hf_repo_git":
-        operation = tool_args.get("operation", "")
-        if operation in [
-            "delete_branch",
-            "delete_tag",
-            "merge_pr",
-            "create_repo",
-            "update_repo",
-        ]:
-            return True
+    # uc_model: alias rolls control which version production points at.
+    if tool_name == "uc_model":
+        return tool_args.get("operation") in {"set_alias", "delete_alias"}
+
+    # hf_to_uc: data ingestion can be large and write a Delta table.
+    if tool_name == "hf_to_uc":
+        return True
 
     return False
 
@@ -234,18 +226,52 @@ def _friendly_error_message(error: Exception) -> str | None:
 
 
 async def _compact_and_notify(session: Session) -> None:
-    """Run compaction and send event if context was reduced."""
+    """Run compaction and send event if context was reduced.
+
+    Catches ``CompactionFailedError`` from ``ContextManager.compact`` and
+    ends the session cleanly instead of letting the caller retry. Without
+    this guard the retry loop pre-HF#213 burned LLM budget at ~$3/Opus
+    attempt while the session never reached the upload path — invisible
+    in telemetry.
+    """
+    from agent.context_manager.manager import CompactionFailedError
+
     cm = session.context_manager
     old_usage = cm.running_context_usage
     logger.debug(
         "Compaction check: usage=%d, max=%d, threshold=%d, needs_compact=%s",
         old_usage, cm.model_max_tokens, cm.compaction_threshold, cm.needs_compaction,
     )
-    await cm.compact(
-        model_name=session.config.model_name,
-        tool_specs=session.tool_router.get_tool_specs_for_llm(),
-        hf_token=session.hf_token,
-    )
+    try:
+        await cm.compact(
+            model_name=session.config.model_name,
+            tool_specs=session.tool_router.get_tool_specs_for_llm(),
+            hf_token=session.hf_token,
+            session=session,
+        )
+    except CompactionFailedError as e:
+        logger.error(
+            "Compaction failed for session %s: %s — terminating session",
+            session.session_id, e,
+        )
+        await session.send_event(Event(
+            event_type="session_terminated",
+            data={
+                "reason": "compaction_failed",
+                "context_usage": cm.running_context_usage,
+                "context_threshold": cm.compaction_threshold,
+                "error": str(e)[:300],
+                "user_message": (
+                    "Your conversation has grown too large to continue. "
+                    "The work you've done is saved — start a new session to keep going."
+                ),
+            },
+        ))
+        # Stop the agent loop. _run_session.finally will still fire
+        # cleanup + trajectory save so the partial session is captured.
+        session.is_running = False
+        return
+
     new_usage = cm.running_context_usage
     if new_usage != old_usage:
         logger.warning(
@@ -537,6 +563,21 @@ class Handlers:
         Handle user input (like user_input_or_turn in codex.rs:1291)
         Returns the final assistant response content, if any.
         """
+        with tracing.trace_span(
+            "agent_turn",
+            attributes={
+                "session_id": session.session_id,
+                "turn_index": session.turn_count,
+                "model": session.config.model_name,
+                "input_chars": len(text or ""),
+            },
+        ):
+            return await Handlers._run_agent_inner(session, text)
+
+    @staticmethod
+    async def _run_agent_inner(
+        session: Session, text: str,
+    ) -> str | None:
         # Clear any stale cancellation flag from a previous run
         session.reset_cancel()
 
@@ -566,8 +607,14 @@ class Handlers:
             if session.is_cancelled:
                 break
 
-            # Compact before calling the LLM if context is near the limit
+            # Compact before calling the LLM if context is near the limit.
+            # _compact_and_notify sets session.is_running=False on
+            # CompactionFailedError; exit before the LLM call would fire
+            # with an over-threshold context (which would just re-trigger
+            # the same failure path).
             await _compact_and_notify(session)
+            if not session.is_running:
+                break
 
             # Doom-loop detection: break out of repeated tool call patterns
             doom_prompt = check_for_doom_loop(session.context_manager.items)
@@ -789,9 +836,17 @@ class Handlers:
                     ) -> tuple[ToolCall, str, dict, str, bool]:
                         if not valid:
                             return (tc, name, args, err, False)
-                        out, ok = await session.tool_router.call_tool(
-                            name, args, session=session, tool_call_id=tc.id
-                        )
+                        with tracing.trace_span(
+                            f"tool.{name}",
+                            attributes={
+                                "tool": name,
+                                "operation": (args or {}).get("operation"),
+                                "tool_call_id": tc.id,
+                            },
+                        ):
+                            out, ok = await session.tool_router.call_tool(
+                                name, args, session=session, tool_call_id=tc.id
+                            )
                         return (tc, name, args, out, ok)
 
                     gather_task = asyncio.ensure_future(asyncio.gather(
@@ -884,7 +939,7 @@ class Handlers:
                 iteration += 1
 
             except ContextWindowExceededError:
-                # Force compact and retry this iteration
+                # Force compact and retry this iteration.
                 cm = session.context_manager
                 logger.warning(
                     "ContextWindowExceededError at iteration %d — forcing compaction "
@@ -893,6 +948,12 @@ class Handlers:
                 )
                 cm.running_context_usage = cm.model_max_tokens + 1
                 await _compact_and_notify(session)
+                # Same guard as the top-of-loop call: if compaction couldn't
+                # bring us under threshold, _compact_and_notify has emitted
+                # session_terminated and cleared is_running. Continuing would
+                # just re-fire the LLM with the same too-big context.
+                if not session.is_running:
+                    break
                 continue
 
             except Exception as e:
@@ -1057,9 +1118,18 @@ class Handlers:
                 )
             )
 
-            output, success = await session.tool_router.call_tool(
-                tool_name, tool_args, session=session, tool_call_id=tc.id
-            )
+            with tracing.trace_span(
+                f"tool.{tool_name}",
+                attributes={
+                    "tool": tool_name,
+                    "operation": (tool_args or {}).get("operation"),
+                    "tool_call_id": tc.id,
+                    "approved": True,
+                },
+            ):
+                output, success = await session.tool_router.call_tool(
+                    tool_name, tool_args, session=session, tool_call_id=tc.id
+                )
 
             return (tc, tool_name, output, success, was_edited)
 
@@ -1175,11 +1245,9 @@ class Handlers:
     @staticmethod
     async def shutdown(session: Session) -> bool:
         """Handle shutdown (like shutdown in codex.rs:1329)"""
-        # Save session trajectory if enabled (fire-and-forget, returns immediately)
         if session.config.save_sessions:
-            logger.info("Saving session...")
-            repo_id = session.config.session_dataset_repo
-            _ = session.save_and_upload_detached(repo_id)
+            logger.info("Saving session trajectory...")
+            session.save_trajectory_local()
 
         session.is_running = False
         await session.send_event(Event(event_type="shutdown"))
@@ -1245,11 +1313,13 @@ async def submission_loop(
         session_holder[0] = session
     logger.info("Agent loop started")
 
-    # Retry any failed uploads from previous sessions (fire-and-forget)
-    if config and config.save_sessions:
-        Session.retry_failed_uploads_detached(
-            directory="session_logs", repo_id=config.session_dataset_repo
-        )
+    # MLflow Tracing — best-effort init. Failure (no workspace creds in unit
+    # tests, etc.) is logged once and never blocks the loop.
+    try:
+        settings = db_client.resolve_settings(session.config)
+        tracing.init_tracing(settings.experiment_path)
+    except Exception as e:
+        logger.debug("Tracing init skipped: %s", e)
 
     try:
         # Main processing loop
@@ -1281,14 +1351,9 @@ async def submission_loop(
         logger.info("Agent loop exited")
 
     finally:
-        # Emergency save if session saving is enabled and shutdown wasn't called properly
         if session.config.save_sessions and session.is_running:
             logger.info("Emergency save: preserving session before exit...")
             try:
-                local_path = session.save_and_upload_detached(
-                    session.config.session_dataset_repo
-                )
-                if local_path:
-                    logger.info("Emergency save successful, upload in progress")
+                session.save_trajectory_local()
             except Exception as e:
                 logger.error(f"Emergency save failed: {e}")

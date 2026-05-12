@@ -407,7 +407,10 @@ def _format_datasets(datasets: list, arxiv_id: str, sort: str) -> str:
 
     if datasets:
         top = datasets[0].get("id", "")
-        lines.append(f'**Inspect top dataset:** hf_inspect_dataset(dataset="{top}")')
+        lines.append(
+            f'**Ingest top dataset into UC:** hf_to_uc(operation="ingest_dataset", '
+            f'repo_id="{top}", create_table=true) — then uc_inspect_dataset describe'
+        )
     return "\n".join(lines)
 
 
@@ -1169,7 +1172,7 @@ HF_PAPERS_TOOL_SPEC = {
         "Combines HuggingFace Hub, arXiv, and Semantic Scholar. Use for exploring research areas, "
         "finding datasets for a task, tracing citation chains, or implementing a paper's approach.\n\n"
         "Typical flows:\n"
-        "  search → read_paper → find_all_resources → hf_inspect_dataset\n"
+        "  search → read_paper → find_all_resources → hf_to_uc → uc_inspect_dataset\n"
         "  search → paper_details → citation_graph → read_paper (trace influence)\n"
         "  snippet_search → paper_details → read_paper (find specific claims)\n\n"
         "Operations:\n"

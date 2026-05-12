@@ -12,25 +12,49 @@ from fastmcp.mcp_config import (
     RemoteMCPServer,
     StdioMCPServer,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 # These two are the canonical server config types for MCP servers.
 MCPServerConfig = Union[StdioMCPServer, RemoteMCPServer]
+
+
+class DatabricksConfig(BaseModel):
+    """Databricks workspace binding. All fields resolved from env at load-time
+    (see configs/main_agent_config.json). The WorkspaceClient reads host/auth
+    from the Databricks SDK unified auth chain; this block carries the
+    workspace-local choices (catalog, warehouse, experiment path, etc.)."""
+
+    host: str | None = None
+    warehouse_id: str | None = None
+    experiment_path: str = "/Shared/ml-intern"
+    uc_catalog: str = "ml_intern"
+    uc_schema: str = "agent"
+    uc_volume: str = "scratch"
+    secret_scope: str = "ml-intern"
+    lakebase_instance: str | None = None
+    instance_pool_id: str | None = None
+    default_node_type_id: str = "g5.xlarge"
+    default_runtime_version: str = "15.4.x-gpu-ml-scala2.12"
+    prompt_registry_name: str = "ml_intern.agent.system_prompt"
+
+    @field_validator("host", "warehouse_id", "lakebase_instance", "instance_pool_id", mode="before")
+    @classmethod
+    def _empty_to_none(cls, v):
+        # ${VAR:-} substitution yields "" for unset env vars; coerce to None
+        # so downstream code can treat "missing" uniformly.
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
 
 class Config(BaseModel):
     """Configuration manager"""
 
     model_name: str
+    databricks: DatabricksConfig = DatabricksConfig()
     mcpServers: dict[str, MCPServerConfig] = {}
     save_sessions: bool = True
-    session_dataset_repo: str = "smolagents/ml-intern-sessions"
     auto_save_interval: int = 1  # Save every N user turns (0 = disabled)
-    # Mid-turn heartbeat: save + upload every N seconds while events are being
-    # emitted. Guards against losing trace data on long-running turns that
-    # crash before turn_complete (e.g. a multi-hour hf_jobs wait that OOMs).
-    # 0 = disabled. Consumed by agent.core.telemetry.HeartbeatSaver.
-    heartbeat_interval_s: int = 60
     yolo_mode: bool = False  # Auto-approve all tool calls without confirmation
     max_iterations: int = 300  # Max LLM calls per agent turn (-1 = unlimited)
 

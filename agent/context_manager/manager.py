@@ -78,6 +78,25 @@ _COMPACT_PROMPT = (
     "will be have to be filled in."
 )
 
+# Per-message ceiling. A single message above this in the preserved tail
+# (first user turn or untouched recent window) defeats compaction because
+# the body passes through verbatim — the post-compact context stays above
+# the threshold and the agent_loop retries compaction indefinitely. We
+# replace such messages with a small placeholder before summarization so
+# the next pass has a chance of bringing usage below threshold.
+_MAX_TOKENS_PER_MESSAGE = 50_000
+
+
+class CompactionFailedError(Exception):
+    """Raised when compaction can't reduce context below the threshold.
+
+    Means a preserved message (system, first user, or untouched tail) is
+    intrinsically too large for one truncation+summarize pass. The caller
+    must terminate the session — retrying just burns LLM budget on the
+    same useless compaction call (cost-amplification pattern from
+    huggingface/ml-intern#213).
+    """
+
 # Used when seeding a brand-new session from prior browser-cached messages.
 # Here we're writing a note to *ourselves* — so preserve the tool-call trail,
 # files produced, and planned next steps in first person. Optimized for
@@ -168,12 +187,35 @@ class ContextManager:
         hf_token: str | None = None,
         local_mode: bool = False,
     ):
-        """Load and render the system prompt from YAML file with Jinja2"""
+        """Load and render the system prompt.
+
+        Resolution order:
+            1. MLflow Prompt Registry under
+               ``$ML_INTERN_PROMPT_NAME`` (default ``ml_intern.agent.system_prompt``)
+               at the alias / version named by ``$ML_INTERN_PROMPT_VERSION``
+               (default ``latest``).
+            2. Bundled YAML ``agent/prompts/<prompt_file_suffix>`` — used in
+               local CLI runs, unit tests, and any environment where the
+               registry isn't reachable.
+
+        The result is fed through Jinja2 (`{{ tools }}` etc.) and decorated
+        with session context (date, user) below.
+        """
+        import os
+        from agent.core.prompt_registry import load_system_prompt as _load_prompt
+
+        prompt_name = os.environ.get("ML_INTERN_PROMPT_NAME", "ml_intern.agent.system_prompt")
+        prompt_version = os.environ.get("ML_INTERN_PROMPT_VERSION") or None
         prompt_file = Path(__file__).parent.parent / "prompts" / f"{prompt_file_suffix}"
 
-        with open(prompt_file, "r") as f:
-            prompt_data = yaml.safe_load(f)
-            template_str = prompt_data.get("system_prompt", "")
+        try:
+            template_str = _load_prompt(
+                prompt_name, version=prompt_version, yaml_path=prompt_file,
+            )
+        except Exception:
+            with open(prompt_file, "r") as f:
+                prompt_data = yaml.safe_load(f)
+                template_str = prompt_data.get("system_prompt", "")
 
         # Get current date and time
         tz = zoneinfo.ZoneInfo("Europe/Paris")
@@ -343,13 +385,116 @@ class ContextManager:
     def needs_compaction(self) -> bool:
         return self.running_context_usage > self.compaction_threshold and bool(self.items)
 
+    def _truncate_oversized(
+        self, messages: list[Message], model_name: str
+    ) -> list[Message]:
+        """Replace any message > _MAX_TOKENS_PER_MESSAGE with a placeholder.
+
+        Typically the offender is a tool output (CSV dump, file contents,
+        bash output) sitting in the untouched tail or first-user position.
+        Those bodies pass through compaction verbatim and keep usage above
+        threshold — the same shape that drove the upstream HF#213 infinite
+        compaction loop.
+
+        System messages are never touched: the slice math in compact() can,
+        in edge cases (items < untouched_messages), let items[0] leak into
+        recent_messages. Defense-in-depth.
+        """
+        from litellm import token_counter
+
+        out: list[Message] = []
+        for msg in messages:
+            if msg.role == "system":
+                out.append(msg)
+                continue
+            try:
+                n = token_counter(model=model_name, messages=[msg.model_dump()])
+            except Exception:
+                # token_counter occasionally raises on edge-case content.
+                # Don't drop the message — keep it; if it's the offender,
+                # compact() will raise CompactionFailedError below.
+                out.append(msg)
+                continue
+            if n <= _MAX_TOKENS_PER_MESSAGE:
+                out.append(msg)
+                continue
+            placeholder = (
+                f"[truncated for compaction — original was {n} tokens, "
+                f"removed to keep context under {self.compaction_threshold} tokens]"
+            )
+            logger.warning(
+                "Truncating %s message: %d -> %d tokens for compaction",
+                msg.role, n, len(placeholder) // 4,
+            )
+            # Preserve all known assistant-side fields when content is replaced.
+            # Anthropic extended-thinking models reject the next request with
+            # "Invalid signature in thinking block" if thinking_blocks is
+            # dropped from a prior assistant message.
+            kept = {
+                k: getattr(msg, k, None)
+                for k in (
+                    "tool_call_id",
+                    "tool_calls",
+                    "name",
+                    "thinking_blocks",
+                    "reasoning_content",
+                    "provider_specific_fields",
+                )
+                if getattr(msg, k, None) is not None
+            }
+            out.append(Message(role=msg.role, content=placeholder, **kept))
+        return out
+
+    def _recompute_usage(self, model_name: str) -> None:
+        """Refresh ``running_context_usage`` from current items via real tokenizer.
+
+        On ``token_counter`` failure we set usage to ``model_max_tokens + 1``
+        so the post-compact threshold check in ``compact()`` raises
+        ``CompactionFailedError``. A char-based fallback undercounts messages
+        that carry their weight in metadata fields the truncation path
+        preserves (``thinking_blocks``, ``tool_calls``,
+        ``provider_specific_fields``): the next LLM call would then exceed
+        the context window anyway and re-enter the compaction path, which
+        is exactly the loop this whole patch is meant to prevent. Failing
+        loud is consistent with the PR's "never retry on uncertain state"
+        invariant.
+        """
+        from litellm import token_counter
+
+        try:
+            self.running_context_usage = token_counter(
+                model=model_name,
+                messages=[m.model_dump() for m in self.items],
+            )
+        except Exception as e:
+            logger.warning(
+                "token_counter failed (%s); marking usage over-threshold so "
+                "compact() raises CompactionFailedError instead of returning "
+                "with an undercount that would re-loop on the next LLM call.",
+                e,
+            )
+            self.running_context_usage = self.model_max_tokens + 1
+
     async def compact(
         self,
         model_name: str,
         tool_specs: list[dict] | None = None,
         hf_token: str | None = None,
+        session=None,
     ) -> None:
-        """Remove old messages to keep history under target size"""
+        """Remove old messages to keep history under target size.
+
+        Raises ``CompactionFailedError`` when the post-compact context is
+        still over the threshold — typically because an individual
+        preserved message exceeds what truncation can fix in one pass.
+        The caller (``agent_loop._compact_and_notify``) must terminate
+        the session; retrying produces the infinite-loop cost-amplification
+        pattern that this method is designed to prevent.
+
+        ``session`` is accepted but currently unused — kept on the
+        signature so future telemetry hooks (cost-attribution for the
+        compaction LLM call) can land without changing every caller.
+        """
         if not self.needs_compaction:
             return
 
@@ -372,12 +517,46 @@ class ContextManager:
         idx = len(self.items) - self.untouched_messages
         while idx > 1 and self.items[idx].role != "user":
             idx -= 1
+        # The real invariant is "idx must be strictly after first_user_idx",
+        # otherwise recent_messages overlaps with what we place in head.
+        # Two failure modes the walk-back alone doesn't cover:
+        #   * len(items) <= untouched_messages -> idx initialises <= 0, the
+        #     loop is a no-op, and recent_messages starts at the system
+        #     message. Rebuild then duplicates system.
+        #   * idx lands at first_user_idx -> first_user ends up in both
+        #     head and recent_messages. Two consecutive user turns ->
+        #     Anthropic API 400.
+        if idx <= first_user_idx:
+            idx = first_user_idx + 1
 
         recent_messages = self.items[idx:]
         messages_to_summarize = self.items[first_user_idx + 1:idx]
 
-        # improbable, messages would have to very long
+        # Truncate oversized messages in the parts we PRESERVE through
+        # compaction (first_user + recent_tail). Messages inside
+        # ``messages_to_summarize`` are folded into the summary, so their
+        # individual size doesn't drive the loop.
+        if first_user_msg is not None:
+            truncated = self._truncate_oversized([first_user_msg], model_name)
+            first_user_msg = truncated[0]
+        recent_messages = self._truncate_oversized(recent_messages, model_name)
+
+        # If there's nothing to summarize but the preserved messages are
+        # now truncated, rebuild and recompute. Without this branch the
+        # method returns silently with the old over-threshold usage and
+        # the agent_loop retries forever.
         if not messages_to_summarize:
+            head = [system_msg] if system_msg else []
+            if first_user_msg:
+                head.append(first_user_msg)
+            self.items = head + recent_messages
+            self._recompute_usage(model_name)
+            if self.running_context_usage > self.compaction_threshold:
+                raise CompactionFailedError(
+                    f"Nothing to summarize but context ({self.running_context_usage}) "
+                    f"still over threshold ({self.compaction_threshold}) after truncation. "
+                    f"System prompt or first user message likely exceeds the budget."
+                )
             return
 
         summary, completion_tokens = await summarize_messages(
@@ -399,13 +578,15 @@ class ContextManager:
         # Count the actual post-compact context — system prompt + first user
         # turn + summary + the preserved tail all contribute, not just the
         # summary. litellm.token_counter uses the model's real tokenizer.
-        from litellm import token_counter
+        self._recompute_usage(model_name)
 
-        try:
-            self.running_context_usage = token_counter(
-                model=model_name,
-                messages=[m.model_dump() for m in self.items],
+        # Hard verify: if compaction still couldn't drop us below the
+        # threshold, retrying just burns budget on the same useless call.
+        # Raise so the caller can terminate the session cleanly.
+        if self.running_context_usage > self.compaction_threshold:
+            raise CompactionFailedError(
+                f"Compaction ineffective: {self.running_context_usage} tokens "
+                f"still over threshold {self.compaction_threshold} after summarize "
+                f"and truncation. Likely the system prompt + first user + summary "
+                f"+ truncated tail still exceeds budget."
             )
-        except Exception as e:
-            logger.warning("token_counter failed post-compact (%s); falling back to rough estimate", e)
-            self.running_context_usage = len(self.system_prompt) // 4 + completion_tokens

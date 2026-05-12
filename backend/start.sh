@@ -1,15 +1,12 @@
 #!/bin/bash
-# Entrypoint for HF Spaces dev mode compatibility.
-# Dev mode spawns CMD multiple times simultaneously on restart.
-# Only the first instance can bind port 7860 — the rest must exit
-# with code 0 so the dev mode daemon doesn't mark the app as crashed.
+# Entrypoint for the Databricks App runtime.
+#
+# Imports inside backend/ are bare (e.g. `from routes.agent import ...`),
+# so we must cd into backend/ before launching uvicorn. Apps inject the
+# bind port via DATABRICKS_APP_PORT (typically 8000); fall back to 7860
+# for local dev when the var is unset.
 
-# Run uvicorn; if it fails due to port conflict, exit cleanly.
-uvicorn main:app --host 0.0.0.0 --port 7860
-EXIT_CODE=$?
-
-if [ $EXIT_CODE -ne 0 ]; then
-    # Check if this was a port-in-use failure (another instance already running)
-    echo "uvicorn exited with code $EXIT_CODE, exiting gracefully."
-    exit 0
-fi
+set -e
+cd "$(dirname "$0")"
+PORT="${DATABRICKS_APP_PORT:-7860}"
+exec python -m uvicorn main:app --host 0.0.0.0 --port "$PORT"

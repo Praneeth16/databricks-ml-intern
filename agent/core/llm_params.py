@@ -65,15 +65,18 @@ _patch_litellm_effort_validation()
 
 
 # Effort levels accepted on the wire.
-#   Anthropic (4.6+):  low | medium | high | xhigh | max   (output_config.effort)
-#   OpenAI direct:     minimal | low | medium | high       (reasoning_effort top-level)
-#   HF router:         low | medium | high                 (extra_body.reasoning_effort)
+#   Anthropic (4.6+):    low | medium | high | xhigh | max   (output_config.effort)
+#   OpenAI direct:       minimal | low | medium | high       (reasoning_effort top-level)
+#   HF router:           low | medium | high                 (extra_body.reasoning_effort)
+#   Databricks FMAPI:    low | medium | high                 (extra_body.reasoning_effort
+#                                                              for Claude-on-Databricks)
 #
 # We validate *shape* here and let the probe cascade walk down on rejection;
 # we deliberately do NOT maintain a per-model capability table.
 _ANTHROPIC_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 _OPENAI_EFFORTS = {"minimal", "low", "medium", "high"}
 _HF_EFFORTS = {"low", "medium", "high"}
+_DATABRICKS_EFFORTS = {"low", "medium", "high"}
 
 
 class UnsupportedEffortError(ValueError):
@@ -153,6 +156,21 @@ def _resolve_llm_params(
                 params["thinking"] = {"type": "adaptive"}
                 params["output_config"] = {"effort": level}
         return params
+
+    if model_name.startswith("databricks/"):
+        # Databricks Foundation Model API + AI Gateway. LiteLLM has native
+        # ``databricks/`` provider that auto-resolves api_base / api_key from
+        # the SDK auth chain (DATABRICKS_HOST + DATABRICKS_TOKEN, profile, or
+        # M2M). We don't pass them explicitly so users running ``databricks
+        # auth login`` work out of the box; if a session token is present
+        # (OBO from Apps), the caller plumbs it via DATABRICKS_TOKEN env in
+        # the request scope.
+        #
+        # FMAPI endpoints reject reasoning_effort outright (both top-level and
+        # via extra_body) — the rejection comes from the served-model schema,
+        # not the gateway. Drop it on this branch; agent default behaviour
+        # remains correct because the parameter is advisory.
+        return {"model": model_name}
 
     if model_name.startswith("bedrock/"):
         # LiteLLM routes ``bedrock/...`` through the Converse adapter, which

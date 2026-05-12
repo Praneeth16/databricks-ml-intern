@@ -23,9 +23,45 @@ class ToolCallSignature:
     args_hash: str
 
 
+def _normalize_args(args_str: str) -> str:
+    """Canonicalise a tool-call arguments string before hashing.
+
+    LLMs emit semantically-identical JSON for the same call with different
+    key orderings (``{"a": 1, "b": 2}`` vs ``{"b": 2, "a": 1}``) or
+    whitespace (``{"a":1}`` vs ``{"a": 1}``). Hashing raw bytes makes the
+    doom-loop detector miss those repeats — three reordered-key calls
+    look like three distinct signatures and the detector stays quiet
+    while the agent burns budget.
+
+    Parse-and-redump with ``sort_keys=True`` + compact separators so
+    trivially-different spellings collapse to one canonical form.
+
+    Falls back to the original string when the input isn't valid JSON
+    (rare provider edge — bare-string ``arguments``). Never raises.
+    """
+    if not args_str:
+        return ""
+    try:
+        return json.dumps(json.loads(args_str), sort_keys=True, separators=(",", ":"))
+    except Exception:
+        # Broad catch: parser surprises on deeply-nested input raise
+        # RecursionError (subclass of RuntimeError, not in the JSON exception
+        # family) and a few exotic floats can blow up json.dumps too. The
+        # helper is documented as never-raising — the pre-fix code hashed
+        # raw bytes unconditionally, so the safe degradation is to fall
+        # back to the original string for anything the canonicaliser can't
+        # handle.
+        return args_str
+
+
 def _hash_args(args_str: str) -> str:
-    """Return a short hash of the JSON arguments string."""
-    return hashlib.md5(args_str.encode()).hexdigest()[:12]
+    """Return a short hash of the JSON arguments string.
+
+    Input is canonicalised via :func:`_normalize_args` first so semantically
+    identical tool calls produce the same hash regardless of key order or
+    whitespace.
+    """
+    return hashlib.md5(_normalize_args(args_str).encode()).hexdigest()[:12]
 
 
 def extract_recent_tool_signatures(

@@ -71,4 +71,7 @@ models/
 checkpoint-*/
 runs/
 wandb/
+mlflow.db
+mlruns/
 frontend/tsconfig.tsbuildinfo
+static/
