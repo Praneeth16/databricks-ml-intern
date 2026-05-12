@@ -226,18 +226,52 @@ def _friendly_error_message(error: Exception) -> str | None:
 
 
 async def _compact_and_notify(session: Session) -> None:
-    """Run compaction and send event if context was reduced."""
+    """Run compaction and send event if context was reduced.
+
+    Catches ``CompactionFailedError`` from ``ContextManager.compact`` and
+    ends the session cleanly instead of letting the caller retry. Without
+    this guard the retry loop pre-HF#213 burned LLM budget at ~$3/Opus
+    attempt while the session never reached the upload path — invisible
+    in telemetry.
+    """
+    from agent.context_manager.manager import CompactionFailedError
+
     cm = session.context_manager
     old_usage = cm.running_context_usage
     logger.debug(
         "Compaction check: usage=%d, max=%d, threshold=%d, needs_compact=%s",
         old_usage, cm.model_max_tokens, cm.compaction_threshold, cm.needs_compaction,
     )
-    await cm.compact(
-        model_name=session.config.model_name,
-        tool_specs=session.tool_router.get_tool_specs_for_llm(),
-        hf_token=session.hf_token,
-    )
+    try:
+        await cm.compact(
+            model_name=session.config.model_name,
+            tool_specs=session.tool_router.get_tool_specs_for_llm(),
+            hf_token=session.hf_token,
+            session=session,
+        )
+    except CompactionFailedError as e:
+        logger.error(
+            "Compaction failed for session %s: %s — terminating session",
+            session.session_id, e,
+        )
+        await session.send_event(Event(
+            event_type="session_terminated",
+            data={
+                "reason": "compaction_failed",
+                "context_usage": cm.running_context_usage,
+                "context_threshold": cm.compaction_threshold,
+                "error": str(e)[:300],
+                "user_message": (
+                    "Your conversation has grown too large to continue. "
+                    "The work you've done is saved — start a new session to keep going."
+                ),
+            },
+        ))
+        # Stop the agent loop. _run_session.finally will still fire
+        # cleanup + trajectory save so the partial session is captured.
+        session.is_running = False
+        return
+
     new_usage = cm.running_context_usage
     if new_usage != old_usage:
         logger.warning(
@@ -573,8 +607,14 @@ class Handlers:
             if session.is_cancelled:
                 break
 
-            # Compact before calling the LLM if context is near the limit
+            # Compact before calling the LLM if context is near the limit.
+            # _compact_and_notify sets session.is_running=False on
+            # CompactionFailedError; exit before the LLM call would fire
+            # with an over-threshold context (which would just re-trigger
+            # the same failure path).
             await _compact_and_notify(session)
+            if not session.is_running:
+                break
 
             # Doom-loop detection: break out of repeated tool call patterns
             doom_prompt = check_for_doom_loop(session.context_manager.items)
@@ -899,7 +939,7 @@ class Handlers:
                 iteration += 1
 
             except ContextWindowExceededError:
-                # Force compact and retry this iteration
+                # Force compact and retry this iteration.
                 cm = session.context_manager
                 logger.warning(
                     "ContextWindowExceededError at iteration %d — forcing compaction "
@@ -908,6 +948,12 @@ class Handlers:
                 )
                 cm.running_context_usage = cm.model_max_tokens + 1
                 await _compact_and_notify(session)
+                # Same guard as the top-of-loop call: if compaction couldn't
+                # bring us under threshold, _compact_and_notify has emitted
+                # session_terminated and cleared is_running. Continuing would
+                # just re-fire the LLM with the same too-big context.
+                if not session.is_running:
+                    break
                 continue
 
             except Exception as e:
