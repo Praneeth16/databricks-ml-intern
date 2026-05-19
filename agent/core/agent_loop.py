@@ -1112,6 +1112,39 @@ class Handlers:
         await session.send_event(Event(event_type="undo_complete"))
 
     @staticmethod
+    async def resume(session: Session, *, session_id: str) -> None:
+        """Reload context from a saved trajectory into the active session.
+
+        The CLI / frontend resolves ``session_id`` against the picker and
+        passes it through here; the heavy lifting (Lakebase fetch +
+        filesystem fallback + replay validation) lives in
+        ``agent.core.session_resume``. We just emit the user-facing event.
+        """
+        from agent.core import session_resume
+
+        # Single entry by id — the picker already filtered by user, we
+        # just need to recover the entry shape so the rest of the resume
+        # code reuses one path. Pull the row and synthesise.
+        user_id = getattr(session, "user_email", None)
+        entries = session_resume.list_session_logs(user_id=user_id)
+        match = next((e for e in entries if e.session_id == session_id), None)
+        if match is None:
+            await session.send_event(Event(
+                event_type="error",
+                data={"error": f"Resume failed: session {session_id!r} not found"},
+            ))
+            return
+
+        try:
+            result = session_resume.restore_session_from_entry(session, match)
+        except Exception as e:
+            await session.send_event(Event(
+                event_type="error", data={"error": f"Resume failed: {e}"},
+            ))
+            return
+        await session.send_event(Event(event_type="resume_complete", data=result))
+
+    @staticmethod
     async def exec_approval(session: Session, approvals: list[dict]) -> None:
         """Handle batch job execution approval"""
         if not session.pending_approval:
@@ -1389,6 +1422,16 @@ async def process_submission(session: Session, submission) -> bool:
 
     if op.op_type == OpType.UNDO:
         await Handlers.undo(session)
+        return True
+
+    if op.op_type == OpType.RESUME:
+        sid = op.data.get("session_id") if op.data else None
+        if not sid:
+            await session.send_event(Event(
+                event_type="error", data={"error": "Resume requires a session_id"},
+            ))
+            return True
+        await Handlers.resume(session, session_id=sid)
         return True
 
     if op.op_type == OpType.EXEC_APPROVAL:

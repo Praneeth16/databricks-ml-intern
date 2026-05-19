@@ -333,6 +333,45 @@ async def event_listener(
             elif event.event_type == "undo_complete":
                 console.print("[dim]Undone.[/dim]")
                 turn_complete_event.set()
+            elif event.event_type == "resume_complete":
+                data = event.data or {}
+                count = data.get("restored_count", 0)
+                dropped = int(data.get("dropped_count", 0) or 0)
+                model = data.get("model_name", "?")
+                source = data.get("source", "?")
+                sid = data.get("session_id", "?")
+                forked = bool(data.get("forked", False))
+                redacted = bool(data.get("had_redacted_content", False))
+                invalid_model = data.get("invalid_saved_model")
+                verb = "Forked from" if forked else "Resumed"
+                console.print(
+                    f"[green]{verb}[/green] [cyan]{sid[:8]}[/cyan] "
+                    f"([cyan]{count}[/cyan] msgs, model [cyan]{model}[/cyan], "
+                    f"source [dim]{source}[/dim])."
+                )
+                if dropped:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] dropped {dropped} "
+                        "malformed message(s) — tool-call alignment may be off."
+                    )
+                if invalid_model:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] saved model "
+                        f"[cyan]{invalid_model}[/cyan] failed validation; "
+                        f"kept current [cyan]{model}[/cyan]."
+                    )
+                if forked:
+                    console.print(
+                        "[dim]Saved log belongs to a different user — kept "
+                        "current session id; future saves go to a fresh slot.[/dim]"
+                    )
+                if redacted:
+                    console.print(
+                        "[yellow]Note:[/yellow] tokens were scrubbed from "
+                        "restored messages at save time; live creds are used "
+                        "for this session.[/dim]"
+                    )
+                turn_complete_event.set()
             elif event.event_type == "tool_log":
                 tool = event.data.get("tool", "") if event.data else ""
                 log = event.data.get("log", "") if event.data else ""
@@ -567,12 +606,87 @@ async def get_user_input(prompt_session: PromptSession) -> str:
 # Slash commands are defined in terminal_display
 
 
+async def _resolve_resume_arg(
+    arg: str,
+    session,
+    *,
+    prompt_session: PromptSession | None,
+) -> str | None:
+    """Resolve a ``--resume`` / ``/resume`` argument to a session_id.
+
+    ``arg`` is the value the user typed (after the slash command name) or
+    the sentinel ``"__pick__"`` for "no arg, open the picker." Returns
+    None when the user cancels, no logs exist, or the argument matches
+    nothing — the explanation is already printed by then.
+
+    The picker lists Lakebase rows for the current user when reachable,
+    falls back to the local ``session_logs/`` directory otherwise. Both
+    sources share the same display format.
+    """
+    from agent.core.session_resume import (
+        DEFAULT_SESSION_LOG_DIR,
+        format_session_log_entry,
+        list_session_logs,
+        resolve_session_arg,
+    )
+
+    console = get_console()
+    user_id = getattr(session, "user_email", None) if session is not None else None
+    entries = list_session_logs(user_id=user_id, directory=DEFAULT_SESSION_LOG_DIR)
+    if not entries:
+        if user_id:
+            console.print(
+                f"[yellow]No saved sessions for {user_id} "
+                "(Lakebase + ./session_logs both empty).[/yellow]"
+            )
+        else:
+            console.print(
+                f"[yellow]No session logs found in ./{DEFAULT_SESSION_LOG_DIR}.[/yellow]"
+            )
+        return None
+
+    if arg and arg != "__pick__":
+        selected = resolve_session_arg(arg, entries)
+        if selected is None:
+            console.print(f"[bold red]No matching saved session:[/bold red] {arg}")
+            return None
+        return selected.session_id
+
+    console.print()
+    console.print("[bold]Saved sessions[/bold]")
+    for index, entry in enumerate(entries, start=1):
+        console.print(format_session_log_entry(index, entry))
+    console.print()
+
+    if prompt_session is None:
+        console.print("[yellow]Cannot prompt for a selection here.[/yellow]")
+        return None
+
+    try:
+        choice = await prompt_session.prompt_async(
+            "Select session number (blank to cancel): "
+        )
+    except (EOFError, KeyboardInterrupt):
+        console.print("[dim]Resume cancelled.[/dim]")
+        return None
+    choice = choice.strip()
+    if not choice:
+        console.print("[dim]Resume cancelled.[/dim]")
+        return None
+    selected = resolve_session_arg(choice, entries)
+    if selected is None:
+        console.print(f"[bold red]Invalid selection:[/bold red] {choice}")
+        return None
+    return selected.session_id
+
+
 async def _handle_slash_command(
     cmd: str,
     config,
     session_holder: list,
     submission_queue: asyncio.Queue,
     submission_id: list[int],
+    prompt_session: PromptSession | None = None,
 ) -> Submission | None:
     """
     Handle a slash command. Returns a Submission to enqueue, or None if
@@ -601,6 +715,26 @@ async def _handle_slash_command(
         return Submission(
             id=f"sub_{submission_id[0]}",
             operation=Operation(op_type=OpType.COMPACT),
+        )
+
+    if command == "/resume":
+        session = session_holder[0] if session_holder else None
+        if session is None:
+            get_console().print(
+                "[bold red]No active session to restore into.[/bold red]"
+            )
+            return None
+        selected_id = await _resolve_resume_arg(
+            arg or "__pick__", session, prompt_session=prompt_session,
+        )
+        if not selected_id:
+            return None
+        submission_id[0] += 1
+        return Submission(
+            id=f"sub_{submission_id[0]}",
+            operation=Operation(
+                op_type=OpType.RESUME, data={"session_id": selected_id},
+            ),
         )
 
     if command == "/model":
@@ -672,8 +806,16 @@ async def _handle_slash_command(
     return None
 
 
-async def main():
-    """Interactive chat with the agent"""
+async def main(model: str | None = None, resume_arg: str | None = None):
+    """Interactive chat with the agent.
+
+    ``resume_arg`` is a sentinel from the ``--resume`` flag:
+      * ``None`` → no resume requested, normal interactive boot.
+      * ``"__pick__"`` → user passed ``--resume`` with no argument;
+        launch the picker once the session is ready.
+      * any other value → treat as a session_id (or its prefix) and
+        attempt resume directly.
+    """
 
     # Clear screen
     os.system("clear" if os.name != "nt" else "cls")
@@ -749,6 +891,25 @@ async def main():
     await ready_event.wait()
 
     submission_id = [0]
+
+    # Initial --resume kick from the CLI flag, if any. Runs once before the
+    # interactive loop opens stdin. Picker resolution happens here so the
+    # user sees the list, picks, then drops into the live session.
+    if resume_arg is not None:
+        session = session_holder[0]
+        selected_id = await _resolve_resume_arg(
+            resume_arg, session, prompt_session=prompt_session,
+        )
+        if selected_id:
+            submission_id[0] += 1
+            await submission_queue.put(Submission(
+                id=f"sub_{submission_id[0]}",
+                operation=Operation(
+                    op_type=OpType.RESUME, data={"session_id": selected_id},
+                ),
+            ))
+            # Pause input loop until resume_complete fires.
+            turn_complete_event.clear()
     # Mirrors codex-rs/tui/src/bottom_pane/mod.rs:137
     # (`QUIT_SHORTCUT_TIMEOUT = Duration::from_secs(1)`). Two Ctrl+C presses
     # within this window quit; a single press cancels the in-flight turn.
@@ -842,7 +1003,8 @@ async def main():
             # Handle slash commands
             if user_input.strip().startswith("/"):
                 sub = await _handle_slash_command(
-                    user_input.strip(), config, session_holder, submission_queue, submission_id
+                    user_input.strip(), config, session_holder, submission_queue, submission_id,
+                    prompt_session,
                 )
                 if sub is None:
                     # Command handled locally, loop back for input
@@ -1099,6 +1261,12 @@ def cli():
                         help="Max LLM requests per turn (default: 50, use -1 for unlimited)")
     parser.add_argument("--no-stream", action="store_true",
                         help="Disable token streaming (use non-streaming LLM calls)")
+    parser.add_argument(
+        "--resume", nargs="?", const="__pick__", default=None,
+        metavar="SESSION_ID",
+        help="Resume a saved session. Pass a session_id (or its prefix) to "
+             "skip the picker, or use --resume alone to choose interactively.",
+    )
     args = parser.parse_args()
 
     try:
@@ -1108,7 +1276,7 @@ def cli():
                 max_iter = 10_000  # effectively unlimited
             asyncio.run(headless_main(args.prompt, model=args.model, max_iterations=max_iter, stream=not args.no_stream))
         else:
-            asyncio.run(main())
+            asyncio.run(main(model=args.model, resume_arg=args.resume))
     except KeyboardInterrupt:
         print("\n\nGoodbye!")
 

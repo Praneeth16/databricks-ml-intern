@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_TOKENS = 200_000
 
+# Public so agent.core.session_resume + the CLI slash command can share one
+# fallback directory for offline (no-Lakebase) saves.
+DEFAULT_SESSION_LOG_DIR = Path("session_logs")
+
 
 def _get_max_tokens_safe(model_name: str) -> int:
     """Return the max input-context tokens for a model.
@@ -53,6 +57,7 @@ class OpType(Enum):
     INTERRUPT = "interrupt"
     UNDO = "undo"
     COMPACT = "compact"
+    RESUME = "resume"
     SHUTDOWN = "shutdown"
 
 
@@ -196,7 +201,13 @@ class Session:
             self.last_auto_save_turn = self.turn_count
 
     def get_trajectory(self) -> dict:
-        """Serialize complete session trajectory for logging"""
+        """Serialize complete session trajectory for logging.
+
+        ``user_id`` is stamped (user_email today, since that is the
+        identity we resolve from Apps OBO + SDK chain) so the resume path
+        can decide whether to continue or fork the saved conversation
+        without an additional lookup.
+        """
         tools: list = []
         if self.tool_router is not None:
             try:
@@ -208,6 +219,7 @@ class Session:
             "session_start_time": self.session_start_time,
             "session_end_time": datetime.now().isoformat(),
             "model_name": self.config.model_name,
+            "user_id": self.user_email,
             "messages": [msg.model_dump() for msg in self.context_manager.items],
             "events": self.logged_events,
             "tools": tools,
@@ -273,10 +285,42 @@ class Session:
                 json.dump(trajectory, f, indent=2)
             tmp_path.replace(filepath)
 
+            # Mirror the trajectory into Lakebase so /resume can pick up the
+            # same conversation from the frontend or another CLI install.
+            # Best-effort — a Lakebase outage doesn't fail the local save.
+            self._mirror_trajectory_to_lakebase(trajectory)
+
             return str(filepath)
         except Exception as e:
             logger.error(f"Failed to save session locally: {e}")
             return None
+
+    def _mirror_trajectory_to_lakebase(self, trajectory: dict) -> None:
+        """Push the trajectory blob into ``ml_intern_sessions.trajectory``.
+
+        Failure is intentionally suppressed: Lakebase may be unconfigured
+        (local CLI dev), the pool may be down, or the user may be running
+        in a context where the import isn't even available. The local
+        filesystem copy is the durable artifact; Lakebase is the
+        cross-device convenience layer.
+        """
+        if not self.user_email:
+            # No identity we can attach this row to — skip rather than
+            # writing under a synthetic "anonymous" user_id that breaks
+            # the per-user listing query.
+            return
+        try:
+            from backend import lakebase
+
+            lakebase.save_trajectory(
+                session_id=self.session_id,
+                user_id=self.user_email,
+                user_email=self.user_email,
+                model_name=self.config.model_name,
+                trajectory=trajectory,
+            )
+        except Exception as e:
+            logger.debug("Lakebase mirror suppressed: %s", e)
 
     def update_local_save_status(
         self, filepath: str, upload_status: str, dataset_url: Optional[str] = None
