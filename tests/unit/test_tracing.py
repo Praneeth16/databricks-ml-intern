@@ -7,7 +7,7 @@ breaking the agent.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -153,3 +153,82 @@ def test_traced_sync_decorator_passthrough_when_uninitialised():
         return x + 1
 
     assert fn(4) == 5
+
+
+# ── workspace-directory collision fallback (issue #14) ──────────────────
+
+
+class _DirCollision(Exception):
+    """Mock of the MLflow BAD_REQUEST surface seen in PTB-smoke run-D."""
+
+
+def test_init_falls_back_to_user_scoped_experiment_on_directory_collision():
+    """``/Shared/ml-intern`` collides with a workspace DIRECTORY on the
+    test workspace (legacy state). ``init_tracing`` must catch the
+    collision class, derive ``/Users/<email>/ml-intern`` via the SDK
+    user lookup, and re-call ``set_experiment``. Verifies the fallback
+    target is bound and the second call returns a real experiment.
+    """
+    fake_experiment = type("E", (), {"experiment_id": "9999", "name": "/Users/u@x/ml-intern"})()
+    err = Exception(
+        "BAD_REQUEST: A node with name 'ml-intern' of type DIRECTORY "
+        "already exists under parent 3955935534744294, cannot create "
+        "node of type MLFLOW_EXPERIMENT"
+    )
+
+    def fake_set_experiment(path):
+        if path == "/Shared/ml-intern":
+            raise err
+        return fake_experiment
+
+    fake_wc = MagicMock()
+    fake_wc.current_user.me.return_value = type("M", (), {"user_name": "u@x"})()
+
+    with patch("mlflow.set_tracking_uri"), \
+         patch("mlflow.set_registry_uri"), \
+         patch("mlflow.set_experiment", side_effect=fake_set_experiment) as set_exp, \
+         patch("agent.core.db_client.get_workspace_client", return_value=fake_wc):
+        ok = tracing.init_tracing("/Shared/ml-intern")
+
+    assert ok is True
+    # Two attempts: original + fallback under user scope.
+    assert set_exp.call_count == 2
+    assert set_exp.call_args_list[1].args[0] == "/Users/u@x/ml-intern"
+
+
+def test_init_falls_back_on_legacy_for_input_string_none_error():
+    """Older MLflow path returns the less-informative ``For input string:
+    "None"`` surface for the same collision. Must be treated identically.
+    """
+    fake_experiment = type("E", (), {"experiment_id": "1111"})()
+    err = Exception('BAD_REQUEST: For input string: "None"')
+
+    def fake_set_experiment(path):
+        if path == "/Shared/ml-intern":
+            raise err
+        return fake_experiment
+
+    fake_wc = MagicMock()
+    fake_wc.current_user.me.return_value = type("M", (), {"user_name": "u@x"})()
+
+    with patch("mlflow.set_tracking_uri"), \
+         patch("mlflow.set_registry_uri"), \
+         patch("mlflow.set_experiment", side_effect=fake_set_experiment) as set_exp, \
+         patch("agent.core.db_client.get_workspace_client", return_value=fake_wc):
+        assert tracing.init_tracing("/Shared/ml-intern") is True
+    assert set_exp.call_count == 2
+
+
+def test_init_does_not_fallback_on_unrelated_failure():
+    """Non-collision errors must bubble out to the warning log, not
+    silently retry against a personal-scope path (where they'd succeed
+    spuriously and mask the real problem).
+    """
+    err = Exception("NETWORK_ERROR: connection refused")
+    with patch("mlflow.set_tracking_uri"), \
+         patch("mlflow.set_registry_uri"), \
+         patch("mlflow.set_experiment", side_effect=err) as set_exp:
+        ok = tracing.init_tracing("/Shared/ml-intern")
+    assert ok is False
+    # Only one attempt — no fallback for unrelated errors.
+    assert set_exp.call_count == 1

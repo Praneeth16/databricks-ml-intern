@@ -467,3 +467,78 @@ async def test_cancel_without_run_id_errors():
     tool = djt.DatabricksJobsTool(wc=_mock_wc(), settings=_make_settings())
     result = await tool._cancel({})
     assert result.get("isError")
+
+
+@pytest.mark.asyncio
+async def test_notebook_upload_injects_pre_install_block_by_default():
+    """Issue #15: serverless_gpu image lacks datasets/trl/peft/accelerate.
+    Every fine-tune job paid one round-trip per missing dep on PTB-smoke
+    run-D. The notebook prelude must pip-install the common ML deps
+    before the user script runs, no opt-in required."""
+    import base64
+    wc = _mock_wc()
+    tool = djt.DatabricksJobsTool(
+        wc=wc, settings=_make_settings(), user_email="alice@ex.com",
+    )
+    tool.session = MagicMock()
+    tool.session.session_id = "abcd-1234-5678-9012"
+
+    await tool._resolve_or_stage_script(
+        {"script": "import datasets"}, as_notebook=True,
+    )
+    posts = [c for c in wc.api_client.do.call_args_list
+             if c.args[0] == "POST" and c.args[1] == "/api/2.0/workspace/import"]
+    decoded = base64.b64decode(posts[0].kwargs["body"]["content"]).decode()
+    # Prelude markers + every pinned spec must appear.
+    assert "_ml_subprocess" in decoded
+    for spec in djt._SERVERLESS_GPU_PRE_INSTALL:
+        assert spec in decoded
+
+
+@pytest.mark.asyncio
+async def test_notebook_upload_pre_install_opt_out():
+    """``pre_install=False`` keeps the env pristine. Useful for users who
+    pin their own deps or want to avoid the install overhead per cold
+    start."""
+    import base64
+    wc = _mock_wc()
+    tool = djt.DatabricksJobsTool(
+        wc=wc, settings=_make_settings(), user_email="alice@ex.com",
+    )
+    tool.session = MagicMock()
+    tool.session.session_id = "abcd-1234-5678-9012"
+
+    await tool._resolve_or_stage_script(
+        {"script": "import datasets", "pre_install": False}, as_notebook=True,
+    )
+    posts = [c for c in wc.api_client.do.call_args_list
+             if c.args[0] == "POST" and c.args[1] == "/api/2.0/workspace/import"]
+    decoded = base64.b64decode(posts[0].kwargs["body"]["content"]).decode()
+    assert "_ml_subprocess" not in decoded
+    for spec in djt._SERVERLESS_GPU_PRE_INSTALL:
+        assert spec not in decoded
+    # User script still present.
+    assert "import datasets" in decoded
+
+
+@pytest.mark.asyncio
+async def test_pre_install_only_applies_to_notebook_path():
+    """Non-notebook script kinds (script / serverless CPU) land via the
+    plain workspace file path — no Databricks notebook source header, no
+    stdout wrapper, no pre-install prelude. Adding one here would risk
+    breaking spark_python_task by injecting top-level subprocess calls."""
+    import base64
+    wc = _mock_wc()
+    tool = djt.DatabricksJobsTool(
+        wc=wc, settings=_make_settings(), user_email="alice@ex.com",
+    )
+    tool.session = MagicMock()
+    tool.session.session_id = "abcd-1234-5678-9012"
+
+    await tool._resolve_or_stage_script(
+        {"script": "print('cpu run')"}, as_notebook=False,
+    )
+    posts = [c for c in wc.api_client.do.call_args_list
+             if c.args[0] == "POST" and c.args[1] == "/api/2.0/workspace/import"]
+    decoded = base64.b64decode(posts[0].kwargs["body"]["content"]).decode()
+    assert "_ml_subprocess" not in decoded

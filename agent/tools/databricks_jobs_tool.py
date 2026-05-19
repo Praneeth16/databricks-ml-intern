@@ -213,6 +213,36 @@ _ml_sys.stderr = _ML_INTERN_TEE(_ml_sys.__stderr__, _ML_INTERN_BUF)
 '''
 
 
+# Common ML deps that the serverless_gpu image (env_version=4, transformers 5.x)
+# doesn't ship. Empirically derived from PTB-smoke run-D (4 iterations burned on
+# missing/incompat packages). Each entry pinned to a range known to work with
+# the runtime's transformers 5.x. Caller can disable with pre_install=False.
+_SERVERLESS_GPU_PRE_INSTALL: tuple[str, ...] = (
+    "datasets>=4.0,<5.0",
+    "trl>=1.4,<2.0",
+    "peft>=0.18,<0.30",
+    "accelerate>=1.5,<2.0",
+)
+
+
+def _pre_install_prelude(specs: tuple[str, ...]) -> str:
+    """Idempotent `pip install --quiet` for each spec; runs before the user
+    script so missing packages don't burn a job round-trip per discovery."""
+    if not specs:
+        return ""
+    spec_literal = ", ".join(repr(s) for s in specs)
+    return f'''\
+import subprocess as _ml_subprocess, sys as _ml_sys_pre
+for _ml_spec in [{spec_literal}]:
+    try:
+        _ml_subprocess.check_call(
+            [_ml_sys_pre.executable, "-m", "pip", "install", "--quiet", _ml_spec],
+        )
+    except Exception as _ml_pip_err:
+        print(f"[ml-intern pre-install] {{_ml_spec}} failed: {{_ml_pip_err}}")
+'''
+
+
 def _wrap_user_script_with_stdout_capture(script: str) -> str:
     """Append a ``dbutils.notebook.exit`` finalizer that surfaces stdout tail.
 
@@ -487,9 +517,20 @@ class DatabricksJobsTool:
             # Imported with format=SOURCE + language=PYTHON; Databricks keeps
             # the full filename (incl. ``.py``) as the notebook's workspace
             # path. notebook_task.notebook_path matches that filename verbatim.
+            # Pre-install prelude (datasets/trl/peft/accelerate) runs first so
+            # the user script doesn't have to embed pip calls — PTB-smoke
+            # run-D ate 4 job round-trips on this exact discovery loop.
+            # Opt-out via args["pre_install"] = False for users that want a
+            # pristine env or have already pinned their own deps.
+            pre_install = args.get("pre_install", True)
+            install_block = (
+                _pre_install_prelude(_SERVERLESS_GPU_PRE_INSTALL)
+                if pre_install else ""
+            )
             content = (
                 "# Databricks notebook source\n"
                 + _NOTEBOOK_STDOUT_WRAPPER_PRELUDE
+                + install_block
                 + _wrap_user_script_with_stdout_capture(script)
             )
             await self._upload_workspace_notebook(path, content)
@@ -944,6 +985,10 @@ DATABRICKS_JOBS_TOOL_SPEC = {
         "If `ML_INTERN_INSTANCE_POOL_ID` is configured, runs default to that pool.\n\n"
         "3. `kind=\"serverless\"` — Serverless compute. Cheapest path for small CPU work. No cluster spec; "
         "deps declared via `dependencies`. Env vars not supported (use UC secrets).\n\n"
+        "4. `kind=\"serverless_gpu\"` — AI Runtime serverless GPU (NVIDIA A10G default). "
+        "Common ML deps (datasets, trl, peft, accelerate) are pre-installed via a prelude — "
+        "your script can `import datasets` etc. directly. Set `pre_install=False` to opt out "
+        "if you've pinned your own versions or want a clean env.\n\n"
         "BEFORE submitting training jobs:\n"
         "- Validate dataset format via `uc_inspect_dataset` (UC) or matching tool.\n"
         "- Models MUST be registered to Unity Catalog (`<catalog>.<schema>.<name>`). "

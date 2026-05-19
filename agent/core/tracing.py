@@ -55,6 +55,13 @@ def init_tracing(experiment_path: str | None) -> bool:
     v3 exporter logs ``trace_info.mlflow_experiment.experiment_id is
     missing`` for every flushed span — a span written outside an active
     ``start_run`` (the agent's normal case) has no run_id to anchor on.
+
+    Workspace-collision fallback: ``mlflow.set_experiment(path)`` raises
+    ``BAD_REQUEST: A node with name ... of type DIRECTORY already exists``
+    when ``path`` collides with a pre-existing Workspace directory (legacy
+    state, leftover artefacts). On that exact error class we retry under
+    ``/Users/<email>/ml-intern`` so the agent never silently runs without
+    traces just because of workspace housekeeping.
     """
     global _INITIALIZED, _EXPERIMENT_ID
     if _INITIALIZED:
@@ -66,17 +73,89 @@ def init_tracing(experiment_path: str | None) -> bool:
 
         mlflow.set_tracking_uri("databricks")
         mlflow.set_registry_uri("databricks-uc")
-        experiment = mlflow.set_experiment(experiment_path)
+        experiment = _set_experiment_with_fallback(mlflow, experiment_path)
+        if experiment is None:
+            return False
         exp_id = getattr(experiment, "experiment_id", None)
         if exp_id:
             _EXPERIMENT_ID = str(exp_id)
         _bind_tracing_destination(experiment)
         _INITIALIZED = True
-        logger.info("MLflow Tracing initialised at experiment=%s", experiment_path)
+        logger.info(
+            "MLflow Tracing initialised at experiment=%s",
+            getattr(experiment, "name", experiment_path),
+        )
         return True
     except Exception as e:
         logger.warning("MLflow Tracing init failed (%s) — running without traces.", e)
         return False
+
+
+def _is_workspace_collision(err: Exception) -> bool:
+    """True when MLflow rejects set_experiment because of a path-name collision.
+
+    Two error shapes seen in the field — both surface the same root cause
+    (the parent already has a child node with that name, and it's a
+    DIRECTORY rather than an MLFLOW_EXPERIMENT):
+      * ``BAD_REQUEST: A node with name 'X' of type DIRECTORY already exists``
+      * ``BAD_REQUEST: For input string: "None"`` (older API path returns
+        a less informative message when the path collision happens inside
+        ``MLFLOW_EXPERIMENT_NAME`` resolution).
+    """
+    msg = str(err)
+    if "already exists" in msg and "DIRECTORY" in msg:
+        return True
+    if "BAD_REQUEST" in msg and 'For input string: "None"' in msg:
+        return True
+    return False
+
+
+def _fallback_experiment_path(original: str) -> str | None:
+    """Derive a user-scoped fallback path when ``original`` is wedged.
+
+    Uses the workspace user's email via ``databricks current-user me`` (via
+    SDK) so each user gets their own personal experiment scope. Returns
+    None when the email isn't resolvable — caller logs once and gives up.
+    """
+    try:
+        from agent.core.db_client import get_workspace_client
+
+        wc = get_workspace_client()
+        me = wc.current_user.me()
+        email = getattr(me, "user_name", None) or getattr(me, "userName", None)
+        if not email:
+            return None
+        # Reuse the leaf segment of the original so the fallback inherits the
+        # caller's naming intent rather than colliding under /Users with
+        # somebody else's prior fallback.
+        leaf = original.rsplit("/", 1)[-1] or "ml-intern"
+        return f"/Users/{email}/{leaf}"
+    except Exception as e:
+        logger.debug("Fallback experiment path resolution failed: %s", e)
+        return None
+
+
+def _set_experiment_with_fallback(mlflow, experiment_path: str):
+    """Run ``mlflow.set_experiment`` with workspace-collision recovery."""
+    try:
+        return mlflow.set_experiment(experiment_path)
+    except Exception as e:
+        if not _is_workspace_collision(e):
+            raise
+        fallback = _fallback_experiment_path(experiment_path)
+        if not fallback:
+            logger.warning(
+                "MLflow experiment %s collided with a workspace directory and "
+                "no user-scoped fallback could be derived — running without traces.",
+                experiment_path,
+            )
+            return None
+        logger.warning(
+            "MLflow experiment %s collides with a workspace directory; "
+            "falling back to %s.",
+            experiment_path, fallback,
+        )
+        return mlflow.set_experiment(fallback)
 
 
 def _bind_tracing_destination(experiment) -> None:
