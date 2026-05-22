@@ -18,9 +18,10 @@ from fastapi import (
     Request,
 )
 from fastapi.responses import StreamingResponse
-from litellm import acompletion
+from litellm import Message, acompletion
 from models import (
     ApprovalRequest,
+    DatasetUploadResponse,
     HealthResponse,
     LLMHealthResponse,
     SessionInfo,
@@ -29,7 +30,15 @@ from models import (
     TruncateRequest,
 )
 from session_manager import MAX_SESSIONS, AgentSession, SessionCapacityError, session_manager
+from starlette.datastructures import FormData, UploadFile
+from uc_volume_uploads import (
+    MAX_DATASET_UPLOAD_BYTES,
+    dataset_context_note,
+    push_dataset_upload_to_volume,
+)
 
+from agent.config import load_config
+from agent.core import db_client
 from agent.core.llm_params import _resolve_llm_params
 
 logger = logging.getLogger(__name__)
@@ -373,6 +382,138 @@ async def submit_input(
     if not success:
         raise HTTPException(status_code=404, detail="Session not found or inactive")
     return {"status": "submitted", "session_id": request.session_id}
+
+
+# Multipart wrappers add ~1 MB of framing on top of a 100 MB file body.
+# Reject obvious over-budget requests at the Content-Length check before
+# spinning up the form parser.
+_DATASET_UPLOAD_MULTIPART_SLACK = 1024 * 1024
+
+
+def _reject_oversize_dataset_upload(request: Request) -> None:
+    raw = request.headers.get("content-length")
+    if raw is None:
+        return
+    try:
+        content_length = int(raw)
+    except (TypeError, ValueError):
+        return
+    if content_length > MAX_DATASET_UPLOAD_BYTES + _DATASET_UPLOAD_MULTIPART_SLACK:
+        raise HTTPException(
+            status_code=413,
+            detail="Dataset upload exceeds the 100 MB limit.",
+        )
+
+
+def _dataset_upload_file_from_form(form: FormData) -> UploadFile:
+    uploaded = [
+        (k, v) for k, v in form.multi_items() if isinstance(v, UploadFile)
+    ]
+    if len(uploaded) != 1:
+        raise HTTPException(
+            status_code=400, detail="Upload exactly one dataset file.",
+        )
+    field_name, upload = uploaded[0]
+    if field_name != "file":
+        raise HTTPException(
+            status_code=400, detail="Missing 'file' upload field.",
+        )
+    return upload
+
+
+@router.post(
+    "/session/{session_id}/datasets",
+    response_model=DatasetUploadResponse,
+)
+async def upload_session_dataset(
+    session_id: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+) -> DatasetUploadResponse:
+    """Upload a dataset file to a per-session UC Volume directory.
+
+    OBO required: the write lands as the human user so the UC audit log
+    names them, not the App service principal. Returns the canonical
+    volume path plus a format-aware ``read_snippet`` the frontend renders
+    so the user (and the agent's next turn) knows how to read the file.
+    """
+    upload_file: UploadFile | None = None
+    try:
+        _reject_oversize_dataset_upload(request)
+        _check_session_access(session_id, user)
+
+        agent_session = session_manager.sessions.get(session_id)
+        if not agent_session or not agent_session.is_active:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if agent_session.is_processing:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot upload a dataset while the agent is processing.",
+            )
+        if agent_session.session.pending_approval:
+            raise HTTPException(
+                status_code=409,
+                detail="Approve or reject pending tools before uploading a dataset.",
+            )
+
+        obo_token = extract_obo_token(request)
+        if not obo_token:
+            # Allow the SDK-chain auth path in local dev (no Apps proxy).
+            # In Apps mode the absence is a real auth failure — return 401
+            # so the user sees an actionable message instead of the write
+            # silently landing under the App service principal.
+            if os.environ.get("DATABRICKS_APP_NAME"):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Missing OBO token; user identity required for upload.",
+                )
+
+        config = load_config(os.environ.get(
+            "ML_INTERN_CONFIG_PATH",
+            os.path.join(os.path.dirname(__file__), "..", "..", "configs",
+                         "main_agent_config.json"),
+        ))
+        settings = db_client.resolve_settings(config)
+        if obo_token:
+            wc = db_client.get_workspace_client_for_user(obo_token, settings.host)
+        else:
+            wc = db_client.get_workspace_client(settings)
+
+        form = await request.form(
+            max_files=1,
+            max_fields=1,
+            max_part_size=MAX_DATASET_UPLOAD_BYTES,
+        )
+        upload_file = _dataset_upload_file_from_form(form)
+
+        uploaded = await push_dataset_upload_to_volume(
+            upload=upload_file,
+            session_id=session_id,
+            volume_base=settings.volume_base,
+            wc=wc,
+        )
+
+        # Stitch the upload reference into the agent context so the next
+        # LLM turn sees the path without the user having to repeat it.
+        agent_session.session.context_manager.add_message(
+            Message(role="user", content=dataset_context_note(uploaded))
+        )
+        logger.info(
+            "Uploaded dataset %s -> %s for session %s",
+            uploaded.original_filename, uploaded.volume_path, session_id,
+        )
+        return DatasetUploadResponse(**uploaded.response_payload())
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Dataset upload failed for session %s", session_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Dataset upload failed. Please try again.",
+        )
+    finally:
+        if upload_file is not None:
+            await upload_file.close()
 
 
 @router.post("/approve")

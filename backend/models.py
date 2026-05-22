@@ -88,6 +88,19 @@ class SessionInfo(BaseModel):
     model: str | None = None
 
 
+class DatasetUploadResponse(BaseModel):
+    """Response for a dataset file uploaded to a UC Volume."""
+
+    session_id: str
+    upload_id: str
+    filename: str
+    original_filename: str
+    volume_path: str
+    size_bytes: int
+    format: str  # csv | json | jsonl | parquet
+    read_snippet: str
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
 
