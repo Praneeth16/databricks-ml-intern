@@ -110,52 +110,95 @@ def _is_workspace_collision(err: Exception) -> bool:
     return False
 
 
-def _fallback_experiment_path(original: str) -> str | None:
-    """Derive a user-scoped fallback path when ``original`` is wedged.
+def _resolve_user_email() -> str | None:
+    """Look up the current workspace user's email via the SDK.
 
-    Uses the workspace user's email via ``databricks current-user me`` (via
-    SDK) so each user gets their own personal experiment scope. Returns
-    None when the email isn't resolvable — caller logs once and gives up.
+    Returns None when the SDK can't authenticate (local CLI dev, unit
+    tests). Caller falls through to a non-user-scoped fallback.
     """
     try:
         from agent.core.db_client import get_workspace_client
 
         wc = get_workspace_client()
         me = wc.current_user.me()
-        email = getattr(me, "user_name", None) or getattr(me, "userName", None)
-        if not email:
-            return None
-        # Reuse the leaf segment of the original so the fallback inherits the
-        # caller's naming intent rather than colliding under /Users with
-        # somebody else's prior fallback.
-        leaf = original.rsplit("/", 1)[-1] or "ml-intern"
-        return f"/Users/{email}/{leaf}"
+        return getattr(me, "user_name", None) or getattr(me, "userName", None)
     except Exception as e:
-        logger.debug("Fallback experiment path resolution failed: %s", e)
+        logger.debug("user-email resolution failed: %s", e)
         return None
 
 
+def _fallback_candidates(original: str) -> list[str]:
+    """Cascade of fallback experiment paths to try in order.
+
+    1. ``/Users/<email>/<leaf>`` — typical clean workspace; deterministic
+       across sessions so the user reuses one experiment.
+    2. ``/Users/<email>/<leaf>-mlflow`` — when the user already has a
+       workspace directory named after the leaf (a real pattern we hit on
+       fe-vm-lakebase-praneeth, where both /Shared/ml-intern AND
+       /Users/<email>/ml-intern existed as DIRECTORY nodes from prior
+       exploration). Suffix is deterministic so still session-stable.
+    3. ``/Users/<email>/<leaf>-<uuid8>`` — last-resort escape; non-stable
+       across sessions but breaks the chain when every nicer name is wedged.
+    """
+    email = _resolve_user_email()
+    if not email:
+        return []
+    leaf = original.rsplit("/", 1)[-1] or "ml-intern"
+    import uuid
+
+    return [
+        f"/Users/{email}/{leaf}",
+        f"/Users/{email}/{leaf}-mlflow",
+        f"/Users/{email}/{leaf}-{uuid.uuid4().hex[:8]}",
+    ]
+
+
 def _set_experiment_with_fallback(mlflow, experiment_path: str):
-    """Run ``mlflow.set_experiment`` with workspace-collision recovery."""
+    """Run ``mlflow.set_experiment`` with workspace-collision recovery.
+
+    Walks the fallback cascade from :func:`_fallback_candidates` because the
+    first user-scoped path can itself collide with a stale workspace
+    directory (observed on fe-vm-lakebase-praneeth). We keep trying until
+    one succeeds, surface the path we settled on, or give up with a single
+    warning.
+    """
     try:
         return mlflow.set_experiment(experiment_path)
     except Exception as e:
         if not _is_workspace_collision(e):
             raise
-        fallback = _fallback_experiment_path(experiment_path)
-        if not fallback:
-            logger.warning(
-                "MLflow experiment %s collided with a workspace directory and "
-                "no user-scoped fallback could be derived — running without traces.",
-                experiment_path,
-            )
-            return None
+
+    candidates = _fallback_candidates(experiment_path)
+    if not candidates:
         logger.warning(
-            "MLflow experiment %s collides with a workspace directory; "
-            "falling back to %s.",
-            experiment_path, fallback,
+            "MLflow experiment %s collided with a workspace directory and "
+            "no user-scoped fallback could be derived — running without traces.",
+            experiment_path,
         )
-        return mlflow.set_experiment(fallback)
+        return None
+
+    last_err: Exception | None = None
+    for candidate in candidates:
+        try:
+            experiment = mlflow.set_experiment(candidate)
+            logger.warning(
+                "MLflow experiment %s collided with a workspace directory; "
+                "fell back to %s.",
+                experiment_path, candidate,
+            )
+            return experiment
+        except Exception as e:
+            if not _is_workspace_collision(e):
+                raise
+            last_err = e
+            logger.debug("Fallback candidate %s also collided; trying next.", candidate)
+
+    logger.warning(
+        "MLflow experiment %s and every fallback in %s collided with workspace "
+        "directories (last error: %s) — running without traces.",
+        experiment_path, candidates, last_err,
+    )
+    return None
 
 
 def _bind_tracing_destination(experiment) -> None:

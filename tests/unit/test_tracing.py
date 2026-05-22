@@ -232,3 +232,75 @@ def test_init_does_not_fallback_on_unrelated_failure():
     assert ok is False
     # Only one attempt — no fallback for unrelated errors.
     assert set_exp.call_count == 1
+
+
+def _collision_err(name: str = "ml-intern", parent: str = "1") -> Exception:
+    return Exception(
+        f"BAD_REQUEST: A node with name '{name}' of type DIRECTORY "
+        f"already exists under parent {parent}, cannot create "
+        "node of type MLFLOW_EXPERIMENT"
+    )
+
+
+def test_init_walks_fallback_cascade_when_user_scoped_path_also_collides():
+    """Observed on fe-vm-lakebase-praneeth (PTB-smoke run-E2): both
+    ``/Shared/ml-intern`` AND ``/Users/<email>/ml-intern`` existed as
+    DIRECTORY nodes from prior exploration. The first user-scoped
+    fallback ALSO collided. The cascade must walk to the next candidate
+    (``<leaf>-mlflow``) and use that.
+    """
+    fake_experiment = type("E", (), {"experiment_id": "5555"})()
+    attempts: list[str] = []
+
+    def fake_set_experiment(path):
+        attempts.append(path)
+        if len(attempts) <= 2:
+            raise _collision_err()
+        return fake_experiment
+
+    fake_wc = MagicMock()
+    fake_wc.current_user.me.return_value = type("M", (), {"user_name": "u@x"})()
+
+    with patch("mlflow.set_tracking_uri"), \
+         patch("mlflow.set_registry_uri"), \
+         patch("mlflow.set_experiment", side_effect=fake_set_experiment), \
+         patch("agent.core.db_client.get_workspace_client", return_value=fake_wc):
+        assert tracing.init_tracing("/Shared/ml-intern") is True
+
+    assert attempts[0] == "/Shared/ml-intern"
+    assert attempts[1] == "/Users/u@x/ml-intern"
+    assert attempts[2] == "/Users/u@x/ml-intern-mlflow"
+    assert len(attempts) == 3
+
+
+def test_init_gives_up_after_full_cascade_exhausted():
+    """When every candidate collides we surface ONE warning and return
+    False so the agent runs without traces rather than retrying in a
+    loop or masking the error.
+    """
+    fake_wc = MagicMock()
+    fake_wc.current_user.me.return_value = type("M", (), {"user_name": "u@x"})()
+
+    with patch("mlflow.set_tracking_uri"), \
+         patch("mlflow.set_registry_uri"), \
+         patch("mlflow.set_experiment", side_effect=_collision_err()) as set_exp, \
+         patch("agent.core.db_client.get_workspace_client", return_value=fake_wc):
+        ok = tracing.init_tracing("/Shared/ml-intern")
+    assert ok is False
+    # Original + 3 cascade candidates = 4 attempts.
+    assert set_exp.call_count == 4
+
+
+def test_init_gives_up_cleanly_when_email_unresolvable():
+    """No SDK auth (local dev, no DATABRICKS_HOST) → cannot build a
+    user-scoped fallback. Must return False without raising, never
+    re-attempting with an empty path.
+    """
+    with patch("mlflow.set_tracking_uri"), \
+         patch("mlflow.set_registry_uri"), \
+         patch("mlflow.set_experiment", side_effect=_collision_err()) as set_exp, \
+         patch("agent.core.db_client.get_workspace_client", side_effect=RuntimeError("no auth")):
+        ok = tracing.init_tracing("/Shared/ml-intern")
+    assert ok is False
+    # Only the original attempt — no fallback path because email unresolved.
+    assert set_exp.call_count == 1
