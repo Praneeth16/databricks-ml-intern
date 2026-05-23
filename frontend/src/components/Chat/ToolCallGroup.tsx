@@ -630,15 +630,20 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     }
   }, [pendingTools, decisions]);
 
-  // Persist error states when tools error
+  // Persist error states when tools error.
+  // Also clear stale persisted errors when the SDK reports a successful
+  // output for the same toolCallId (a retry that landed). Without the
+  // clear, the red badge from the failed attempt outlived the green
+  // success badge on the retry — HF upstream #247.
   useEffect(() => {
     for (const tool of tools) {
-      const currentlyHasError = tool.state === 'output-error';
+      const currentlyHasError = tool.state === 'output-error' && !isCancelledTool(tool);
       const persistedError = getToolError(tool.toolCallId);
 
-      // Persist error state if we detect it and haven't already
       if (currentlyHasError && !persistedError) {
         setToolError(tool.toolCallId, true);
+      } else if (tool.state === 'output-available' && persistedError) {
+        setToolError(tool.toolCallId, false);
       }
     }
   }, [tools, setToolError, getToolError]);

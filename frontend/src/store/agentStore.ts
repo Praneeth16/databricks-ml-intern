@@ -452,7 +452,15 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
 
   setToolError: (toolCallId, hasError) => {
     set((state) => {
-      const updated = { ...state.toolErrors, [toolCallId]: hasError };
+      // Drop the key on clear so a stale ``true`` doesn't linger across
+      // reloads (toolErrors is persisted). Setting it to ``false`` was a
+      // valid but heavier write — HF upstream #247 cleans this up.
+      const updated = { ...state.toolErrors };
+      if (hasError) {
+        updated[toolCallId] = true;
+      } else {
+        delete updated[toolCallId];
+      }
       saveToolErrors(updated);
       return { toolErrors: updated };
     });
