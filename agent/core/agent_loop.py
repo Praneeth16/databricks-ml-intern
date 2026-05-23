@@ -120,6 +120,57 @@ def _needs_approval(
 _MAX_LLM_RETRIES = 3
 _LLM_RETRY_DELAYS = [5, 15, 30]  # seconds between retries
 
+# -- No-tool continuation guard (HF upstream #237) -----------------------
+# Cap retry attempts when a text-only response tries to stop with plan
+# items still unfinished. Two retries is enough to catch the common
+# "I'll keep working" → forgot to call a tool pattern without burning
+# tokens forever on a model that genuinely thinks it's done.
+_NO_TOOL_INCOMPLETE_PLAN_RETRY_LIMIT = 2
+
+
+def _unfinished_plan_items(session: "Session") -> list[dict[str, str]]:
+    """Return plan items still pending or in_progress on the session.
+
+    Used by the no-tool continuation guard: if the agent emitted a
+    text-only response (finish_reason='stop', zero tool calls) but the
+    plan it tracked via plan_tool still has unfinished work, we inject
+    a corrective prompt and retry instead of handing control back to
+    the user prematurely.
+    """
+    plan = getattr(session, "current_plan", None) or []
+    unfinished: list[dict[str, str]] = []
+    for item in plan:
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        if status in {"pending", "in_progress"}:
+            unfinished.append(item)
+    return unfinished
+
+
+def _format_plan_items_for_guard(items: list[dict[str, str]], limit: int = 4) -> str:
+    formatted: list[str] = []
+    for item in items[:limit]:
+        item_id = item.get("id") or "?"
+        content = item.get("content") or "(unnamed task)"
+        status = item.get("status") or "unknown"
+        formatted.append(f"{item_id}. {content} [{status}]")
+    if len(items) > limit:
+        formatted.append(f"... and {len(items) - limit} more")
+    return "; ".join(formatted)
+
+
+def _no_tool_incomplete_plan_prompt(items: list[dict[str, str]]) -> str:
+    summary = _format_plan_items_for_guard(items)
+    return (
+        "[SYSTEM: CONTINUATION GUARD] Your previous response ended without any "
+        "tool calls, but the task is not complete. The current plan still has "
+        f"unfinished items: {summary}. Do not return control to the user yet. "
+        "Continue from the next unfinished item and make at least one tool call "
+        "now. If you genuinely cannot continue, first use tools to inspect the "
+        "state or verify the blocker."
+    )
+
 
 def _is_transient_error(error: Exception) -> bool:
     """Return True for errors that are likely transient and worth retrying."""
@@ -705,6 +756,7 @@ class Handlers:
         final_response = None
         errored = False
         max_iterations = session.config.max_iterations
+        no_tool_incomplete_plan_retries = 0
 
         while max_iterations == -1 or iteration < max_iterations:
             # ── Cancellation check: before LLM call ──
@@ -824,8 +876,54 @@ class Handlers:
                         Event(event_type="assistant_stream_end", data={})
                     )
 
-                # If no tool calls, add assistant message and we're done
+                # If no tool calls, add assistant message and we're done.
+                # Continuation guard (HF upstream #237): when the agent
+                # planned work via plan_tool but the latest response is
+                # text-only AND items are still pending/in_progress, retry
+                # once with a corrective system message instead of handing
+                # control back to the user prematurely. Capped to avoid
+                # burning tokens on a model that genuinely thinks it's done.
                 if not tool_calls:
+                    unfinished_plan = _unfinished_plan_items(session)
+                    if (
+                        unfinished_plan
+                        and no_tool_incomplete_plan_retries
+                        < _NO_TOOL_INCOMPLETE_PLAN_RETRY_LIMIT
+                    ):
+                        logger.info(
+                            "No tool calls with unfinished plan; retrying agent turn "
+                            "(attempt %d/%d)",
+                            no_tool_incomplete_plan_retries + 1,
+                            _NO_TOOL_INCOMPLETE_PLAN_RETRY_LIMIT,
+                        )
+                        if content:
+                            assistant_msg = _assistant_message_from_result(
+                                llm_result, model_name=llm_params.get("model"),
+                            )
+                            session.context_manager.add_message(
+                                assistant_msg, token_count,
+                            )
+                        session.context_manager.add_message(
+                            Message(
+                                role="user",
+                                content=_no_tool_incomplete_plan_prompt(unfinished_plan),
+                            )
+                        )
+                        no_tool_incomplete_plan_retries += 1
+                        await session.send_event(Event(
+                            event_type="tool_log",
+                            data={
+                                "tool": "system",
+                                "log": (
+                                    "Plan still has unfinished items after a "
+                                    "text-only response — retrying instead of "
+                                    "returning to the prompt."
+                                ),
+                            },
+                        ))
+                        iteration += 1
+                        continue
+
                     logger.debug(
                         "Agent loop ending: no tool calls. "
                         "finish_reason=%s, token_count=%d, "
@@ -847,6 +945,11 @@ class Handlers:
                         session.context_manager.add_message(assistant_msg, token_count)
                         final_response = content
                     break
+
+                # A successful tool call resets the no-tool retry counter so
+                # the next genuine text-only stop isn't penalised by an
+                # earlier guard hit.
+                no_tool_incomplete_plan_retries = 0
 
                 # Validate tool call args (one json.loads per call, once)
                 # and split into good vs bad

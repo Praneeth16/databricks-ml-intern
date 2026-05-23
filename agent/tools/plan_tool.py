@@ -54,20 +54,25 @@ class PlanTool:
                     "isError": True,
                 }
 
-        # Store the raw todos structure in memory
-        _current_plan = todos
+        # Defensive copy so the no-tool continuation guard in agent_loop
+        # can inspect the snapshot without races against a follow-up
+        # plan_tool call mutating the same list.
+        stored_todos = [dict(todo) for todo in todos]
+        _current_plan = stored_todos
+        if self.session is not None:
+            self.session.current_plan = stored_todos
 
         # Emit plan update event if session is available
         if self.session:
             await self.session.send_event(
                 Event(
                     event_type="plan_update",
-                    data={"plan": todos},
+                    data={"plan": stored_todos},
                 )
             )
 
         # Format only for display using terminal_display utility
-        formatted_output = format_plan_tool_output(todos)
+        formatted_output = format_plan_tool_output(stored_todos)
 
         return {
             "formatted": formatted_output,

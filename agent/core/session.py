@@ -134,6 +134,13 @@ class Session:
         # Key absent → not probed yet; fall back to the raw preference.
         self.model_effective_effort: dict[str, str | None] = {}
 
+        # Last plan_tool snapshot. Populated whenever the LLM calls
+        # plan_tool; read by the no-tool continuation guard in agent_loop
+        # so a text-only response that tries to stop while plan items are
+        # still pending / in_progress gets one corrective retry instead of
+        # quietly handing control back to the user.
+        self.current_plan: list[dict[str, str]] = []
+
     async def send_event(self, event: Event) -> None:
         """Send event back to client and log to trajectory"""
         await self.event_queue.put(event)
