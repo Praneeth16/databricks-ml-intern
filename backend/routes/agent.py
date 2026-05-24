@@ -28,6 +28,8 @@ from models import (
     SessionResponse,
     SubmitRequest,
     TruncateRequest,
+    YoloPolicyRequest,
+    YoloPolicyResponse,
 )
 from session_manager import MAX_SESSIONS, AgentSession, SessionCapacityError, session_manager
 from starlette.datastructures import FormData, UploadFile
@@ -370,6 +372,64 @@ async def delete_session(
     if not success:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"status": "deleted", "session_id": session_id}
+
+
+@router.patch(
+    "/session/{session_id}/yolo",
+    response_model=YoloPolicyResponse,
+)
+async def set_session_yolo(
+    session_id: str,
+    request: YoloPolicyRequest,
+    user: dict = Depends(get_current_user),
+) -> YoloPolicyResponse:
+    """Apply / clear a session's YOLO auto-approval policy.
+
+    Returns the updated policy plus the budget snapshot the frontend
+    renders next to the toggle. The accumulator
+    (``auto_approval_estimated_spend_usd``) is intentionally NOT reset
+    when YOLO flips off and back on — that would let a user game a
+    capped session by flicking the toggle.
+    """
+    _check_session_access(session_id, user)
+    agent_session = session_manager.sessions.get(session_id)
+    if not agent_session or not agent_session.is_active:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    agent_session.session.set_auto_approval_policy(
+        enabled=request.enabled,
+        cost_cap_usd=request.cost_cap_usd,
+    )
+
+    return YoloPolicyResponse(
+        enabled=agent_session.session.auto_approval_enabled,
+        cost_cap_usd=agent_session.session.auto_approval_cost_cap_usd,
+        estimated_spend_usd=agent_session.session.auto_approval_estimated_spend_usd,
+        remaining_usd=agent_session.session.auto_approval_remaining_usd(),
+    )
+
+
+@router.get(
+    "/session/{session_id}/yolo",
+    response_model=YoloPolicyResponse,
+)
+async def get_session_yolo(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> YoloPolicyResponse:
+    """Read the current YOLO policy + budget snapshot. Frontend uses
+    this on session restore so the toggle reflects persisted state."""
+    _check_session_access(session_id, user)
+    agent_session = session_manager.sessions.get(session_id)
+    if not agent_session or not agent_session.is_active:
+        raise HTTPException(status_code=404, detail="Session not found")
+    s = agent_session.session
+    return YoloPolicyResponse(
+        enabled=s.auto_approval_enabled,
+        cost_cap_usd=s.auto_approval_cost_cap_usd,
+        estimated_spend_usd=s.auto_approval_estimated_spend_usd,
+        remaining_usd=s.auto_approval_remaining_usd(),
+    )
 
 
 @router.post("/submit")

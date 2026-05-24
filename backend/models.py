@@ -94,6 +94,24 @@ class SessionInfo(BaseModel):
     model: str | None = None
 
 
+class YoloPolicyRequest(BaseModel):
+    """PATCH body for ``/api/session/{sid}/yolo``."""
+
+    enabled: bool
+    # Capped at $10k just to stop a typo from authorising runaway spend.
+    # Practical UX values are $1–$100.
+    cost_cap_usd: float | None = Field(None, ge=0, le=10_000)
+
+
+class YoloPolicyResponse(BaseModel):
+    """Current YOLO state + remaining-budget snapshot for the UI."""
+
+    enabled: bool
+    cost_cap_usd: float | None
+    estimated_spend_usd: float
+    remaining_usd: float | None
+
+
 class DatasetUploadResponse(BaseModel):
     """Response for a dataset file uploaded to a UC Volume."""
 

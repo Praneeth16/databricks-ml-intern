@@ -1008,12 +1008,57 @@ class Handlers:
                 if session.is_cancelled:
                     break
 
-                # Separate good tools into approval-required vs auto-execute
+                # Separate good tools into approval-required vs auto-execute.
+                # Per-session YOLO policy (#17) layers on top: if the static
+                # _needs_approval check says "ask", consult should_auto_approve
+                # to see whether a budget-gated auto-approve still applies.
+                from agent.core.approval_policy import should_auto_approve
+
                 approval_required_tools: list[tuple[ToolCall, str, dict]] = []
                 non_approval_tools: list[tuple[ToolCall, str, dict]] = []
                 for tc, tool_name, tool_args in good_tools:
                     if _needs_approval(tool_name, tool_args, session.config):
-                        approval_required_tools.append((tc, tool_name, tool_args))
+                        approved, estimate, block_reason = should_auto_approve(
+                            session, tool_name, tool_args,
+                        )
+                        if approved:
+                            # Surface the auto-approval to the UI + accumulate
+                            # spend so the next call sees the updated budget.
+                            session.add_auto_approval_estimated_spend(
+                                estimate.estimated_cost_usd
+                            )
+                            session.add_estimated_spend(estimate.estimated_cost_usd)
+                            await session.send_event(Event(
+                                event_type="tool_log",
+                                data={
+                                    "tool": "system",
+                                    "log": (
+                                        f"YOLO auto-approved {tool_name} "
+                                        f"({estimate.label or '?'}): est "
+                                        f"${(estimate.estimated_cost_usd or 0):.4f}. "
+                                        f"Remaining budget: "
+                                        f"{session.auto_approval_remaining_usd()}"
+                                    ),
+                                },
+                            ))
+                            non_approval_tools.append((tc, tool_name, tool_args))
+                        else:
+                            # Block reason already says why; surface it so the
+                            # human approval UI can show "would exceed budget"
+                            # etc. block_reason=None means "policy off".
+                            if block_reason and session.auto_approval_enabled:
+                                await session.send_event(Event(
+                                    event_type="auto_approval_blocked",
+                                    data={
+                                        "tool_name": tool_name,
+                                        "estimated_cost_usd": estimate.estimated_cost_usd,
+                                        "remaining_usd": (
+                                            session.auto_approval_remaining_usd()
+                                        ),
+                                        "reason": block_reason,
+                                    },
+                                ))
+                            approval_required_tools.append((tc, tool_name, tool_args))
                     else:
                         non_approval_tools.append((tc, tool_name, tool_args))
 

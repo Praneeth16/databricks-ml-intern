@@ -152,6 +152,15 @@ class Session:
         self.actual_cost_usd: Optional[float] = None
         self._last_reconcile_ts: Optional[float] = None
 
+        # YOLO auto-approval policy (#17). When enabled, tool calls whose
+        # estimated cost plus the running total stay under ``cost_cap_usd``
+        # bypass the human approval gate. ``estimated_spend_usd`` tracks
+        # only the spend that the auto-approve path actually authorised,
+        # so toggling YOLO off/on doesn't reset ``total_cost_usd``.
+        self.auto_approval_enabled: bool = False
+        self.auto_approval_cost_cap_usd: Optional[float] = None
+        self.auto_approval_estimated_spend_usd: float = 0.0
+
     async def send_event(self, event: Event) -> None:
         """Send event back to client and log to trajectory"""
         await self.event_queue.put(event)
@@ -185,6 +194,47 @@ class Session:
         """Switch the active model and update the context window limit."""
         self.config.model_name = model_name
         self.context_manager.model_max_tokens = _get_max_tokens_safe(model_name)
+
+    def set_auto_approval_policy(
+        self, *, enabled: bool, cost_cap_usd: Optional[float],
+    ) -> None:
+        """Apply a new YOLO config from the API. Doesn't touch the
+        running spend so the budget is honoured across reconfigures."""
+        self.auto_approval_enabled = bool(enabled)
+        self.auto_approval_cost_cap_usd = (
+            float(cost_cap_usd) if cost_cap_usd is not None else None
+        )
+
+    def add_auto_approval_estimated_spend(
+        self, amount_usd: Optional[float],
+    ) -> None:
+        """Best-effort accumulator for spend authorised by the YOLO gate.
+
+        Distinct from ``total_cost_usd`` so we can show "spent under YOLO"
+        vs "spent total this session" in the UI. None-safe so the call
+        site doesn't have to branch on a catalog-miss CostEstimate.
+        """
+        if amount_usd is None:
+            return
+        try:
+            self.auto_approval_estimated_spend_usd = round(
+                self.auto_approval_estimated_spend_usd + float(amount_usd), 6,
+            )
+        except (TypeError, ValueError):
+            return
+
+    def auto_approval_remaining_usd(self) -> Optional[float]:
+        """Budget left under the YOLO cap (None when uncapped)."""
+        if self.auto_approval_cost_cap_usd is None:
+            return None
+        return max(
+            0.0,
+            round(
+                self.auto_approval_cost_cap_usd
+                - self.auto_approval_estimated_spend_usd,
+                6,
+            ),
+        )
 
     def add_estimated_spend(self, amount_usd: Optional[float]) -> None:
         """Best-effort accumulator for the pre-call cost estimate.

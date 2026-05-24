@@ -84,14 +84,15 @@ DATABRICKS_NODE_PRICE_USD_PER_HOUR: dict[str, float] = {
 DEFAULT_JOB_TIMEOUT_HOURS = 0.5
 DEFAULT_SANDBOX_RESERVATION_HOURS = 1.0
 
-# Tool names that NEVER auto-approve regardless of YOLO policy — destructive
-# or paid-irreversible ops where a budget gate alone isn't safety enough.
-# Consumed by #17's ``should_auto_approve`` predicate.
+# Tool names that NEVER auto-approve regardless of YOLO policy —
+# destructive or registry-mutating ops where a budget gate alone isn't
+# safety enough. ``databricks_jobs`` is deliberately NOT here: the budget
+# gate is exactly what YOLO is supposed to provide for it. Consumed by
+# #17's ``should_auto_approve`` predicate.
 NEVER_AUTO_APPROVE: frozenset[str] = frozenset({
     "uc_volume_rm",
     "uc_model_set_alias",
     "uc_model_delete_alias",
-    "databricks_jobs",  # any spend; force review (override per-op below)
 })
 
 _DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.IGNORECASE)
