@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class OpType(str, Enum):
@@ -51,7 +51,13 @@ class SubmitRequest(BaseModel):
     """Request to submit user input."""
 
     session_id: str
-    text: str
+    # Cap text size to prevent context-bloat / cost-amplification: a runaway
+    # or malicious client could otherwise attach megabytes that then ride
+    # along in every subsequent turn until /api/compact fires. 100k chars ≈
+    # 25k tokens — well above any reasonable single prompt. Empty bodies
+    # also fail validation (min_length=1) so the LLM never receives a
+    # blank turn.
+    text: str = Field(..., min_length=1, max_length=100_000)
 
 
 class TruncateRequest(BaseModel):
