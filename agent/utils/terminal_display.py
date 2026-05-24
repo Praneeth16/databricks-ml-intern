@@ -6,6 +6,7 @@ import re
 
 from rich.console import Console
 from rich.markdown import Heading, Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.theme import Theme
 
@@ -434,22 +435,64 @@ def print_yolo_approve(count: int) -> None:
 
 # ── Help ───────────────────────────────────────────────────────────────
 
-HELP_TEXT = f"""\
-{_I}[bold]Commands[/bold]
-{_I}  [cyan]/help[/cyan]            Show this help
-{_I}  [cyan]/undo[/cyan]            Undo last turn
-{_I}  [cyan]/compact[/cyan]         Compact context window
-{_I}  [cyan]/resume[/cyan] [id]     Pick up a saved session (Lakebase or local logs)
-{_I}  [cyan]/model[/cyan] [id]      Show available models or switch
-{_I}  [cyan]/effort[/cyan] [level]  Reasoning effort (minimal|low|medium|high|xhigh|max|off)
-{_I}  [cyan]/yolo[/cyan]            Toggle auto-approve mode
-{_I}  [cyan]/status[/cyan]          Current model & turn count
-{_I}  [cyan]/quit[/cyan]            Exit"""
+# Slash-command table. ``format_help_text`` derives column widths from the
+# rows at print-time, so adding a longer command (or arg blurb) keeps the
+# description column aligned without manual padding. Three fields per row:
+# (command, args, description).
+HELP_ROWS: tuple[tuple[str, str, str], ...] = (
+    ("/help", "", "Show this help"),
+    ("/undo", "", "Undo last turn"),
+    ("/compact", "", "Compact context window"),
+    ("/resume", "[id]", "Pick up a saved session (Lakebase or local logs)"),
+    ("/model", "[id]", "Show available models or switch"),
+    ("/effort", "[level]", "Set reasoning effort preference"),
+    ("/yolo", "", "Toggle auto-approve mode"),
+    ("/status", "", "Current model & turn count"),
+    ("/quit", "", "Exit"),
+)
+
+
+def _help_column_widths(
+    rows: tuple[tuple[str, str, str], ...],
+) -> tuple[int, int]:
+    return (
+        max(len(command) for command, _, _ in rows),
+        max(len(args) for _, args, _ in rows),
+    )
+
+
+def _format_help_row(
+    command: str,
+    args: str,
+    description: str,
+    command_width: int,
+    args_width: int,
+) -> str:
+    command_gap = " " * (command_width - len(command) + 2)
+    args_gap = " " * (args_width - len(args) + 2)
+    command_markup = f"[cyan]{escape(command)}[/cyan]"
+    args_markup = f"[muted]{escape(args)}[/muted]" if args else ""
+    return f"{_I}  {command_markup}{command_gap}{args_markup}{args_gap}{description}"
+
+
+def format_help_text(rows: tuple[tuple[str, str, str], ...] | None = None) -> str:
+    """Render the help block with description column aligned by row widths."""
+    help_rows = HELP_ROWS if rows is None else rows
+    command_width, args_width = _help_column_widths(help_rows)
+    return "\n".join(
+        [f"{_I}[bold]Commands[/bold]"]
+        + [
+            _format_help_row(
+                command, args, description, command_width, args_width,
+            )
+            for command, args, description in help_rows
+        ]
+    )
 
 
 def print_help() -> None:
     _console.print()
-    _console.print(HELP_TEXT)
+    _console.print(format_help_text())
     _console.print()
 
 
