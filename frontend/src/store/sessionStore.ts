@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { SessionMeta } from '@/types/agent';
+import type { SessionMeta, YoloPolicySnapshot } from '@/types/agent';
 import { deleteMessages, moveMessages } from '@/lib/chat-message-store';
 import { moveBackendMessages, deleteBackendMessages } from '@/lib/backend-message-store';
 
@@ -24,6 +24,9 @@ interface SessionStore {
    *  Used when we rehydrate an expired session into a freshly-created backend
    *  session — preserves title, timestamps, and messages. */
   renameSession: (oldId: string, newId: string) => void;
+  /** Update a session's YOLO snapshot. Called after a successful
+   *  PATCH /api/session/{sid}/yolo or on session reattach via GET. */
+  updateSessionYolo: (id: string, snapshot: YoloPolicySnapshot) => void;
 }
 
 export const useSessionStore = create<SessionStore>()(
@@ -117,6 +120,22 @@ export const useSessionStore = create<SessionStore>()(
         set((state) => ({
           sessions: state.sessions.map((s) =>
             s.id === id ? { ...s, needsAttention: needs } : s
+          ),
+        }));
+      },
+
+      updateSessionYolo: (id: string, snapshot: YoloPolicySnapshot) => {
+        set((state) => ({
+          sessions: state.sessions.map((s) =>
+            s.id === id
+              ? {
+                  ...s,
+                  autoApprovalEnabled: snapshot.enabled,
+                  autoApprovalCostCapUsd: snapshot.cost_cap_usd,
+                  autoApprovalEstimatedSpendUsd: snapshot.estimated_spend_usd,
+                  autoApprovalRemainingUsd: snapshot.remaining_usd,
+                }
+              : s,
           ),
         }));
       },

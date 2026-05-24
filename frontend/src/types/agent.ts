@@ -21,6 +21,20 @@ export interface SessionMeta {
    *  disables input until the user chooses to restore-with-summary or
    *  start fresh. */
   expired?: boolean;
+  /** YOLO auto-approval policy snapshot. Populated from the /yolo
+   *  endpoint after a PATCH or on session restore. Fields default to
+   *  off when missing. */
+  autoApprovalEnabled?: boolean;
+  autoApprovalCostCapUsd?: number | null;
+  autoApprovalEstimatedSpendUsd?: number;
+  autoApprovalRemainingUsd?: number | null;
+}
+
+export interface YoloPolicySnapshot {
+  enabled: boolean;
+  cost_cap_usd: number | null;
+  estimated_spend_usd: number;
+  remaining_usd: number | null;
 }
 
 export interface ToolApproval {
