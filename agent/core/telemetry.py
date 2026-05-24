@@ -81,6 +81,11 @@ async def record_llm_call(
     """Emit an ``llm_call`` event and return the extracted usage dict so
     callers can stash it on their result object if they want."""
     usage = extract_usage(response) if response is not None else {}
+    # LiteLLM's catalog covers a lot of providers; for FMAPI it often
+    # returns 0 because the endpoint name doesn't match an upstream
+    # entry. Fall back to our static FMAPI catalog (issue #16) so the
+    # YOLO budget gate has a non-zero number to work with on Claude /
+    # Llama / DBRX served through Databricks.
     cost_usd = 0.0
     if response is not None:
         try:
@@ -88,6 +93,28 @@ async def record_llm_call(
             cost_usd = float(completion_cost(completion_response=response) or 0.0)
         except Exception:
             cost_usd = 0.0
+    if cost_usd == 0.0 and usage:
+        try:
+            from agent.core.cost_estimation import estimate_llm_cost
+
+            est = estimate_llm_cost(
+                model,
+                int(usage.get("prompt_tokens") or 0),
+                int(usage.get("completion_tokens") or 0),
+            )
+            if est.estimated_cost_usd is not None:
+                cost_usd = est.estimated_cost_usd
+        except Exception as e:
+            logger.debug("fmapi fallback price lookup failed: %s", e)
+
+    # Accumulate into the session running total so the YOLO policy and
+    # any UI surface that exposes "spent so far" both read the same field.
+    try:
+        if hasattr(session, "add_estimated_spend"):
+            session.add_estimated_spend(cost_usd)
+    except Exception as e:
+        logger.debug("session.add_estimated_spend suppressed: %s", e)
+
     from agent.core.session import Event  # local import to avoid cycle
     try:
         await session.send_event(Event(

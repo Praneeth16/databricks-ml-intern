@@ -141,6 +141,17 @@ class Session:
         # quietly handing control back to the user.
         self.current_plan: list[dict[str, str]] = []
 
+        # Pre-call cost accumulator (issue #16). Bumped by every completed
+        # LLM call (via telemetry.record_llm_call) and every billable
+        # tool submission (databricks_jobs, sandbox_create). The YOLO
+        # auto-approval gate (#17) reads this to decide whether the next
+        # call would exceed the user's cap. ``actual_cost_usd`` is the
+        # post-hoc reconcile against system.billing.usage, lagged ~15min;
+        # see ``reconcile_actual_cost`` below.
+        self.total_cost_usd: float = 0.0
+        self.actual_cost_usd: Optional[float] = None
+        self._last_reconcile_ts: Optional[float] = None
+
     async def send_event(self, event: Event) -> None:
         """Send event back to client and log to trajectory"""
         await self.event_queue.put(event)
@@ -174,6 +185,51 @@ class Session:
         """Switch the active model and update the context window limit."""
         self.config.model_name = model_name
         self.context_manager.model_max_tokens = _get_max_tokens_safe(model_name)
+
+    def add_estimated_spend(self, amount_usd: Optional[float]) -> None:
+        """Best-effort accumulator for the pre-call cost estimate.
+
+        None-safe so call sites that get a ``CostEstimate(None, ...)``
+        from the estimator (unknown price) don't have to branch. The
+        catalog-miss case is surfaced to the human via the YOLO policy;
+        the accumulator just stays put.
+        """
+        if amount_usd is None:
+            return
+        try:
+            self.total_cost_usd = round(self.total_cost_usd + float(amount_usd), 6)
+        except (TypeError, ValueError):
+            return
+
+    async def reconcile_actual_cost(self) -> None:
+        """Refresh ``actual_cost_usd`` from ``system.billing.usage`` for
+        the workspace user. Best-effort; failure (no warehouse, no
+        permissions) is logged at debug and the field stays put. Rate
+        limited to one query per 60s to keep the warehouse load light.
+        """
+        import time as _t
+
+        now = _t.monotonic()
+        if (
+            self._last_reconcile_ts is not None
+            and now - self._last_reconcile_ts < 60
+        ):
+            return
+        self._last_reconcile_ts = now
+        if not self.user_email:
+            return
+        try:
+            from agent.core import cost_estimation, db_client
+
+            settings = db_client.resolve_settings(self.config)
+            actual = await asyncio.to_thread(
+                cost_estimation.query_actual_usd_for_user,
+                settings, self.user_email,
+            )
+            if actual is not None:
+                self.actual_cost_usd = round(float(actual), 4)
+        except Exception as e:
+            logger.debug("reconcile_actual_cost suppressed: %s", e)
 
     def effective_effort_for(self, model_name: str) -> str | None:
         """Resolve the effort level to actually send for ``model_name``.
