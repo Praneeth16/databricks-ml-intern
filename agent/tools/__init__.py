@@ -26,6 +26,7 @@ from agent.tools.uc_dataset_tools import (
 )
 from agent.tools.uc_model_tools import UC_MODEL_TOOL_SPEC, uc_model_handler
 from agent.tools.uc_volume_tools import UC_VOLUME_TOOL_SPEC, uc_volume_handler
+from agent.tools.web_search_tool import WEB_SEARCH_TOOL_SPEC, web_search_handler
 
 __all__ = [
     "ToolResult",
@@ -48,4 +49,6 @@ __all__ = [
     "github_list_repos_handler",
     "GITHUB_READ_FILE_TOOL_SPEC",
     "github_read_file_handler",
+    "WEB_SEARCH_TOOL_SPEC",
+    "web_search_handler",
 ]

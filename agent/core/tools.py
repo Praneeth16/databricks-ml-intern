@@ -39,6 +39,7 @@ from agent.tools.github_read_file import (
 )
 from agent.tools.hf_to_uc_tool import HF_TO_UC_TOOL_SPEC, hf_to_uc_handler
 from agent.tools.papers_tool import HF_PAPERS_TOOL_SPEC, hf_papers_handler
+from agent.tools.web_search_tool import WEB_SEARCH_TOOL_SPEC, web_search_handler
 from agent.tools.plan_tool import PLAN_TOOL_SPEC, plan_tool_handler
 from agent.tools.repos_tool import REPOS_TOOL_SPEC, repos_handler
 from agent.tools.research_tool import RESEARCH_TOOL_SPEC, research_handler
@@ -305,6 +306,13 @@ def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
             description=HF_PAPERS_TOOL_SPEC["description"],
             parameters=HF_PAPERS_TOOL_SPEC["parameters"],
             handler=hf_papers_handler,
+        ),
+        # Current-web lookup (DuckDuckGo HTML; no API key)
+        ToolSpec(
+            name=WEB_SEARCH_TOOL_SPEC["name"],
+            description=WEB_SEARCH_TOOL_SPEC["description"],
+            parameters=WEB_SEARCH_TOOL_SPEC["parameters"],
+            handler=web_search_handler,
         ),
         # Planning and job management tools
         ToolSpec(
