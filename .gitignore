@@ -48,6 +48,10 @@ frontend/.eslintcache
 frontend/npm-debug.log*
 frontend/yarn-debug.log*
 frontend/yarn-error.log*
+# Playwright artefacts
+frontend/test-results/
+frontend/playwright-report/
+frontend/playwright/.cache/
 
 # Docker
 .docker/
