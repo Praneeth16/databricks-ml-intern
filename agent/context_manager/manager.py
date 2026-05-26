@@ -227,11 +227,28 @@ class ContextManager:
         # Get HF user info from OAuth token
         hf_user_info = _get_hf_username(hf_token)
 
+        # Pull the skill catalog (one-liner per registered skill). Lives
+        # outside the YAML so contributors can drop a skill into
+        # ``agent/skills/<name>/`` and the agent picks it up on next boot.
+        try:
+            from agent.skills import skill_catalog_for_prompt
+
+            skill_catalog = skill_catalog_for_prompt()
+        except Exception:
+            skill_catalog = ""
+
         template = Template(template_str)
         static_prompt = template.render(
             tools=tool_specs,
             num_tools=len(tool_specs),
+            skill_catalog=skill_catalog,
         )
+
+        if skill_catalog and "{{ skill_catalog }}" not in template_str:
+            # YAML template was authored before the skill loader existed
+            # (or the user-supplied YAML doesn't include the placeholder).
+            # Append the catalog so the agent still sees it.
+            static_prompt = f"{static_prompt}\n\n{skill_catalog}\n"
 
         # CLI-specific context for local mode
         if local_mode:

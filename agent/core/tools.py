@@ -39,6 +39,7 @@ from agent.tools.github_read_file import (
 )
 from agent.tools.hf_to_uc_tool import HF_TO_UC_TOOL_SPEC, hf_to_uc_handler
 from agent.tools.papers_tool import HF_PAPERS_TOOL_SPEC, hf_papers_handler
+from agent.tools.read_skill_tool import READ_SKILL_TOOL_SPEC, read_skill_handler
 from agent.tools.web_search_tool import WEB_SEARCH_TOOL_SPEC, web_search_handler
 from agent.tools.plan_tool import PLAN_TOOL_SPEC, plan_tool_handler
 from agent.tools.repos_tool import REPOS_TOOL_SPEC, repos_handler
@@ -313,6 +314,13 @@ def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
             description=WEB_SEARCH_TOOL_SPEC["description"],
             parameters=WEB_SEARCH_TOOL_SPEC["parameters"],
             handler=web_search_handler,
+        ),
+        # Domain-specific playbooks (Kaggle tabular, CV, NLP, ...) — read on demand.
+        ToolSpec(
+            name=READ_SKILL_TOOL_SPEC["name"],
+            description=READ_SKILL_TOOL_SPEC["description"],
+            parameters=READ_SKILL_TOOL_SPEC["parameters"],
+            handler=read_skill_handler,
         ),
         # Planning and job management tools
         ToolSpec(

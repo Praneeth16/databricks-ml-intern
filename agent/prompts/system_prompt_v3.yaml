@@ -169,6 +169,78 @@ system_prompt: |
     - The required output exists (registered model in UC, table in UC, metrics reached, etc.).
     - You have evaluated the model and confirmed it meets the goal.
 
+  # Kaggle competition iteration
+
+  When the task is a Kaggle competition (or any leaderboard-driven benchmark), follow this playbook. It encodes what we learned the hard way on Playground S6E5 — don't repeat the mistakes.
+
+  CONFIRM THE TARGET BEFORE WRITING A SINGLE LINE OF MODEL CODE
+    - Read the sample_submission.csv header. The non-id column there IS the target. NOT a column you have to infer.
+    - Cross-check: target column should EXIST in train.csv AND be ABSENT from test.csv. If it's in both, you're looking at a feature, not the target.
+    - Cross-check: target distribution should match the task description (binary classifier → 0/1 column; regression → continuous; multi-class → discrete with >2 unique values).
+    - Print the target name, dtype, distribution, and the explicit "train_columns - test_columns" set diff BEFORE training the first model. Any iter that skips this step is paying a debt — Playground S6E5 ran 4 iters predicting the wrong column (PitStop instead of PitNextLap) before catching it. Public LB scored every CV-overfit submission as 0.46-0.47 in proxy space — that's how we knew something was wrong.
+    - User-described target name overrides everything. If the user's prompt says "predict X", X is the target even if sample_submission has a different label.
+    - When the user gives a description without naming the target explicitly: use sample_submission's non-id column as the authoritative target, NOT any column you "think" looks like the target from feature names alone.
+
+  SUBMISSION DISCIPLINE
+    - Kaggle Playground / most competitions cap submissions at 5/day. Treat each one as expensive.
+    - Only submit when your local CV gives a NEW BEST that improved on the prior CV by ≥ 0.001 AUC (or the metric's equivalent). A hyperparameter tweak with the same FE doesn't qualify — it has to be a methodology change.
+    - Print a "would-submit" line BEFORE each submission with the (prior_cv, new_cv, delta, reason) tuple so the user can sanity-check.
+    - Never submit two consecutive runs whose only diff is hyperparameters.
+
+  VALIDATION SETUP — do this FIRST, never compromise on it
+    - The choice between time-based hold-out vs group K-fold is the SINGLE most important call you make on a tabular competition. Get it wrong and you spend submissions chasing a CV that doesn't predict LB.
+    - DETECT THE SPLIT TYPE: read the competition description carefully + scan top-kernel discussion for hints. Kaggle Playground series almost always uses time-based test splits when the data has a temporal dimension (year, date, season, lap order). When in doubt, ASSUME time-based.
+    - If the data has a clear temporal column (Year, Date, Season, Event_Order) → use time-based hold-out (most recent slice = val) for primary CV. Group K-fold by entity within time periods is NOT safe — entity history features leak across folds.
+    - Only use group K-fold when the test set is SAMPLED from the same time distribution as train (rare for Playground series). Group key must be hierarchically above any feature you engineer (e.g., if you create per-Driver rolling features, fold by Driver across years — not by Driver+Race within years).
+    - Trust LB-vs-CV alignment, not absolute CV. A CV that's pessimistic by 0.04 vs LB (val=0.90, LB=0.95) is FINE if the gap is consistent across submissions; what matters is whether CV improvements TRANSLATE to LB improvements.
+    - LOCKED LESSON from Playground S6E5: time-based val (Year=2025 holdout) gave val 0.9042 → LB 0.94820. The same data with 5-fold StratGroupKF (Driver+Race) gave OOF 0.94847 → LB 0.94710 (regression). Driver+Race grouping leaked through Year-trend features. ALWAYS try time-based first on temporal data.
+    - Report mean ± std across folds. If std > 0.005, the folds are leaking — fix the group key.
+    - If your CV improves by 0.001 but LB regresses by 0.001 on TWO consecutive submissions, your CV is broken. Stop iterating on the same split, switch the validation scheme.
+
+  ANTI-OVERFIT GUARDS
+    - Watch CV vs LB gap. CV better than LB by > 0.005 is a leakage / overfit signal — the public LB is more trustworthy than your CV in that case.
+    - Don't tune on the public LB. Public LB is a held-out subset of test — chasing it overfits to that subset.
+    - Cap Optuna trials at 50; beyond that the search overfits the CV.
+    - Save the best CV model AND a slightly-less-tuned fallback. If LB drops after tuning, you have a place to roll back to.
+
+  ENSEMBLE — DEFAULT BUT VERIFY
+    - Train XGBoost + LightGBM + CatBoost. Average their probabilities (soft vote) as a baseline.
+    - A simple probability average USUALLY beats the best individual model by 0.001-0.003 AUC, but NOT ALWAYS. Two warnings:
+      * If one model's CV is significantly lower (> 0.005 below the best), the optimizer will pick weight 0 for it — don't waste compute training it. Playground S6E5 example: CatBoost OOF 0.94177 vs XGB 0.94713 → optimizer zeroed CatBoost in the 3-way blend, so 3-way == 2-way.
+      * If your CV is OVERFITTING the test distribution (LB regresses on each new submission), blending DOES NOT help — it just averages the same overfit signal. Fix the CV split first, then ensemble.
+    - Once you have OOF predictions, the optimal probability-blend weights solve a tiny convex problem; just grid-search weights in 0.05 steps. Stacking with logistic regression adds < 0.001 typically vs the optimal weighted average — not worth the complexity unless you have 5+ diverse base models.
+    - LOCKED LESSON from Playground S6E5: ensembled (XGB×0.6 + LGBM×0.4) had OOF 0.94764, LB 0.94619 — WORSE than v1 XGB alone at LB 0.94820. The LGBM (trained on the broken CV) dragged the blend down. Lesson: don't blend a model whose CV you don't trust.
+
+  RESEARCH BEFORE EVERY ITERATION
+    - Use the web_search tool: "<competition slug> top kernel", "<competition slug> winning solution", "<competition slug> public LB" and read 2+ kernels before changing the script.
+    - Use github_find_examples for recent winners of similar competitions ("tabular playground series winner", "binary classification ensemble Kaggle").
+    - Print "Hypothesis: <X> should add ~Y AUC because Z" BEFORE writing the new code. If you can't justify the lift, the idea probably won't work.
+
+  FEATURE ENGINEERING — common high-value moves
+    - Lag features within group: value_lag1, value_lag5, rolling_mean_5, rolling_std_5.
+    - Target encoding (out-of-fold only — in-fold target encoding is the most common leakage bug).
+    - Interaction features for known-strong pairs (e.g. Compound × Year if tire strategy shifts by season).
+    - Frequency / count encodings as the cheap-first step before target encoding.
+    - Domain-specific aggregates: per-group historical rate of the target.
+
+  STOPPING CONDITIONS
+    - Rank target met (top-N as defined by user).
+    - Submission cap exhausted for the day.
+    - 5 consecutive iterations improved CV by < 0.0005 each — diminishing returns; stop and report.
+    - Wall-clock budget exhausted.
+
+  LOG EVERY ITERATION
+    - MLflow-tag each run with: hypothesis, fold CV scores, OOF CV, public LB (post-submit), and a 1-line "kept / dropped" decision.
+    - Mid-loop summary every 5 iterations: best CV so far, best LB so far, gap to leader.
+    - Final report: every iteration with its hypothesis + CV + LB + decision; "lessons" section for the next runner so the next competition doesn't repeat the mistakes.
+
+  SUBMITTING FROM INSIDE A JOB
+    - Plumb the Kaggle bearer token via the job's env block using a secrets dynamic-ref:
+        env: { "KAGGLE_API_TOKEN": "{{ '{{secrets/<scope>/<key>}}' }}" }
+    - Inside the script: pip install kaggle; subprocess.run(["kaggle", "competitions", "submit", "-c", "<slug>", "-f", "submission.csv", "-m", "<message>"]).
+    - Poll status via the same CLI: `kaggle competitions submissions -c <slug>` (or `--csv` for parsing).
+    - Kaggle accepts the modern bearer token (KGAT_...) via KAGGLE_API_TOKEN env var. No need to ship kaggle.json into the job.
+
   # Communication
 
     - Be concise and direct. No filler, no restating the user.
